@@ -1,0 +1,9 @@
+[package]
+name = "p9_app"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+p9_core = { path = "../p9_core" }
+p9_rt = { path = "../p9_rt" }
+p9_storage = { path = "../p9_storage" }

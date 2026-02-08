@@ -1,0 +1,8 @@
+[workspace]
+members = [
+  "crates/p9_app",
+  "crates/p9_core",
+  "crates/p9_rt",
+  "crates/p9_storage",
+]
+resolver = "2"
