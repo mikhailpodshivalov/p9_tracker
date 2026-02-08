@@ -1,4 +1,6 @@
-use crate::model::{Chain, ChainId, Instrument, Phrase, ProjectData};
+use crate::model::{
+    Chain, ChainId, Instrument, InstrumentId, Phrase, PhraseId, ProjectData,
+};
 
 #[derive(Clone, Debug)]
 pub enum EngineCommand {
@@ -10,6 +12,19 @@ pub enum EngineCommand {
         track_index: usize,
         row: usize,
         chain_id: Option<ChainId>,
+    },
+    SetChainRowPhrase {
+        chain_id: ChainId,
+        row: usize,
+        phrase_id: Option<PhraseId>,
+        transpose: i8,
+    },
+    SetPhraseStep {
+        phrase_id: PhraseId,
+        step_index: usize,
+        note: Option<u8>,
+        velocity: u8,
+        instrument_id: Option<InstrumentId>,
     },
     UpsertChain {
         chain: Chain,
@@ -27,6 +42,10 @@ pub enum EngineError {
     InvalidTempo,
     InvalidTrackIndex(usize),
     InvalidSongRow(usize),
+    InvalidChainRow(usize),
+    InvalidPhraseStep(usize),
+    MissingChain(ChainId),
+    MissingPhrase(PhraseId),
 }
 
 pub struct Engine {
@@ -80,6 +99,48 @@ impl Engine {
                     .get_mut(row)
                     .ok_or(EngineError::InvalidSongRow(row))?;
                 *slot = chain_id;
+                Ok(())
+            }
+            EngineCommand::SetChainRowPhrase {
+                chain_id,
+                row,
+                phrase_id,
+                transpose,
+            } => {
+                let chain = self
+                    .project
+                    .chains
+                    .get_mut(&chain_id)
+                    .ok_or(EngineError::MissingChain(chain_id))?;
+
+                let target_row = chain
+                    .rows
+                    .get_mut(row)
+                    .ok_or(EngineError::InvalidChainRow(row))?;
+                target_row.phrase_id = phrase_id;
+                target_row.transpose = transpose;
+                Ok(())
+            }
+            EngineCommand::SetPhraseStep {
+                phrase_id,
+                step_index,
+                note,
+                velocity,
+                instrument_id,
+            } => {
+                let phrase = self
+                    .project
+                    .phrases
+                    .get_mut(&phrase_id)
+                    .ok_or(EngineError::MissingPhrase(phrase_id))?;
+
+                let step = phrase
+                    .steps
+                    .get_mut(step_index)
+                    .ok_or(EngineError::InvalidPhraseStep(step_index))?;
+                step.note = note;
+                step.velocity = velocity;
+                step.instrument_id = instrument_id;
                 Ok(())
             }
             EngineCommand::UpsertChain { chain } => {
