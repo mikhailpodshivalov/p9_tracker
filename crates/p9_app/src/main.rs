@@ -1,28 +1,45 @@
 mod runtime;
+mod ui;
 
 use p9_core::engine::{Engine, EngineCommand};
-use p9_core::model::{Chain, FxCommand, Groove, Instrument, InstrumentType, Phrase, Scale, Table};
+use p9_core::model::{FxCommand, Groove, Instrument, InstrumentType, Scale, Table};
 use p9_rt::audio::{
     build_preferred_audio_backend, start_with_noop_fallback, AudioMetrics,
 };
 use p9_rt::midi::{NoopMidiInput, NoopMidiOutput};
 use p9_storage::project::ProjectEnvelope;
 use runtime::{RuntimeCommand, RuntimeCoordinator};
+use ui::{UiAction, UiController};
 
 fn main() {
     let mut engine = Engine::new("p9_tracker song");
     let _ = engine.apply_command(EngineCommand::SetTempo(128));
 
-    let chain = Chain::new(0);
-    let _ = engine.apply_command(EngineCommand::UpsertChain { chain });
+    let mut runtime = RuntimeCoordinator::new(24);
+    let mut ui = UiController::default();
 
-    let phrase = Phrase::new(0);
-    let _ = engine.apply_command(EngineCommand::UpsertPhrase { phrase });
-
-    let mut instrument = Instrument::new(0, InstrumentType::Synth, "Init Synth");
-    instrument.table_id = Some(0);
-    instrument.note_length_steps = 2;
-    let _ = engine.apply_command(EngineCommand::UpsertInstrument { instrument });
+    apply_ui(
+        &mut ui,
+        &mut engine,
+        &mut runtime,
+        UiAction::EnsureInstrument {
+            instrument_id: 0,
+            instrument_type: InstrumentType::Synth,
+            name: "UI Init Synth".to_string(),
+        },
+    );
+    apply_ui(
+        &mut ui,
+        &mut engine,
+        &mut runtime,
+        UiAction::EnsureChain { chain_id: 0 },
+    );
+    apply_ui(
+        &mut ui,
+        &mut engine,
+        &mut runtime,
+        UiAction::EnsurePhrase { phrase_id: 0 },
+    );
 
     let table = Table::new(0);
     let _ = engine.apply_command(EngineCommand::UpsertTable { table });
@@ -31,6 +48,100 @@ fn main() {
         row: 0,
         note_offset: 2,
         volume: 96,
+    });
+
+    let mut instrument = Instrument::new(0, InstrumentType::Synth, "UI Init Synth");
+    instrument.table_id = Some(0);
+    instrument.note_length_steps = 2;
+    let _ = engine.apply_command(EngineCommand::UpsertInstrument { instrument });
+
+    apply_ui(
+        &mut ui,
+        &mut engine,
+        &mut runtime,
+        UiAction::BindTrackRowToChain {
+            song_row: 0,
+            chain_id: Some(0),
+        },
+    );
+    apply_ui(
+        &mut ui,
+        &mut engine,
+        &mut runtime,
+        UiAction::BindChainRowToPhrase {
+            chain_id: 0,
+            chain_row: 0,
+            phrase_id: Some(0),
+            transpose: 0,
+        },
+    );
+
+    apply_ui(
+        &mut ui,
+        &mut engine,
+        &mut runtime,
+        UiAction::SelectPhrase(0),
+    );
+    apply_ui(
+        &mut ui,
+        &mut engine,
+        &mut runtime,
+        UiAction::SelectStep(0),
+    );
+    apply_ui(
+        &mut ui,
+        &mut engine,
+        &mut runtime,
+        UiAction::EditStep {
+            phrase_id: 0,
+            step_index: 0,
+            note: Some(61),
+            velocity: 100,
+            instrument_id: Some(0),
+        },
+    );
+    apply_ui(
+        &mut ui,
+        &mut engine,
+        &mut runtime,
+        UiAction::EditStep {
+            phrase_id: 0,
+            step_index: 4,
+            note: Some(64),
+            velocity: 100,
+            instrument_id: Some(0),
+        },
+    );
+    apply_ui(
+        &mut ui,
+        &mut engine,
+        &mut runtime,
+        UiAction::EditStep {
+            phrase_id: 0,
+            step_index: 8,
+            note: Some(67),
+            velocity: 100,
+            instrument_id: Some(0),
+        },
+    );
+
+    let _ = engine.apply_command(EngineCommand::SetStepFx {
+        phrase_id: 0,
+        step_index: 0,
+        fx_slot: 0,
+        fx: Some(FxCommand {
+            code: "TRN".to_string(),
+            value: 52,
+        }),
+    });
+    let _ = engine.apply_command(EngineCommand::SetStepFx {
+        phrase_id: 0,
+        step_index: 0,
+        fx_slot: 1,
+        fx: Some(FxCommand {
+            code: "VOL".to_string(),
+            value: 90,
+        }),
     });
 
     let groove = Groove {
@@ -56,63 +167,18 @@ fn main() {
         scale_id: Some(1),
     });
 
-    let _ = engine.apply_command(EngineCommand::SetChainRowPhrase {
-        chain_id: 0,
-        row: 0,
-        phrase_id: Some(0),
-        transpose: 0,
-    });
-
-    let _ = engine.apply_command(EngineCommand::SetPhraseStep {
-        phrase_id: 0,
-        step_index: 0,
-        note: Some(61), // intentionally out-of-scale to show quantization
-        velocity: 100,
-        instrument_id: Some(0),
-    });
-    let _ = engine.apply_command(EngineCommand::SetPhraseStep {
-        phrase_id: 0,
-        step_index: 4,
-        note: Some(64),
-        velocity: 100,
-        instrument_id: Some(0),
-    });
-    let _ = engine.apply_command(EngineCommand::SetPhraseStep {
-        phrase_id: 0,
-        step_index: 8,
-        note: Some(67),
-        velocity: 100,
-        instrument_id: Some(0),
-    });
-    let _ = engine.apply_command(EngineCommand::SetStepFx {
-        phrase_id: 0,
-        step_index: 0,
-        fx_slot: 0,
-        fx: Some(FxCommand {
-            code: "TRN".to_string(),
-            value: 52,
-        }),
-    });
-    let _ = engine.apply_command(EngineCommand::SetStepFx {
-        phrase_id: 0,
-        step_index: 0,
-        fx_slot: 1,
-        fx: Some(FxCommand {
-            code: "VOL".to_string(),
-            value: 90,
-        }),
-    });
-
-    let _ = engine.apply_command(EngineCommand::SetSongRowChain {
-        track_index: 0,
-        row: 0,
-        chain_id: Some(0),
-    });
-    let _ = engine.apply_command(EngineCommand::SetTrackLevel {
-        track_index: 0,
-        level: 100,
-    });
-    let _ = engine.apply_command(EngineCommand::SetMasterLevel { level: 110 });
+    apply_ui(
+        &mut ui,
+        &mut engine,
+        &mut runtime,
+        UiAction::SetTrackLevel(100),
+    );
+    apply_ui(
+        &mut ui,
+        &mut engine,
+        &mut runtime,
+        UiAction::SetMasterLevel(110),
+    );
     let _ = engine.apply_command(EngineCommand::SetMixerSends {
         mfx: 20,
         delay: 30,
@@ -123,15 +189,28 @@ fn main() {
     let audio_backend_name = started_audio.backend().backend_name();
     let audio_used_fallback = started_audio.used_fallback;
 
-    let mut runtime = RuntimeCoordinator::new(24);
-    runtime.enqueue_commands([RuntimeCommand::Rewind, RuntimeCommand::Start]);
-
     let mut midi_input = NoopMidiInput;
     let mut midi_output = NoopMidiOutput::default();
     let mut events_total = 0usize;
     let mut midi_total = 0usize;
     let mut last_audio_metrics = AudioMetrics::default();
     let mut last_voice_steals = 0u64;
+
+    apply_ui(
+        &mut ui,
+        &mut engine,
+        &mut runtime,
+        UiAction::TogglePlayStop,
+    );
+    let _ = runtime.run_tick(&engine, started_audio.backend_mut(), &mut midi_output);
+
+    runtime.enqueue_command(RuntimeCommand::Rewind);
+    apply_ui(
+        &mut ui,
+        &mut engine,
+        &mut runtime,
+        UiAction::TogglePlayStop,
+    );
 
     for _ in 0..24 {
         let _mapped = runtime.ingest_midi_input(&mut midi_input);
@@ -155,8 +234,17 @@ fn main() {
         };
         last_voice_steals = report.audio_voices_stolen_total;
     }
+
+    apply_ui(
+        &mut ui,
+        &mut engine,
+        &mut runtime,
+        UiAction::SelectStep(0),
+    );
+
     started_audio.backend_mut().stop();
     let transport = runtime.snapshot();
+    let ui_snapshot = ui.snapshot(&engine, &runtime);
 
     let envelope = ProjectEnvelope::new(engine.snapshot().clone());
     let _ = envelope.validate_format();
@@ -164,7 +252,7 @@ fn main() {
     let restored = ProjectEnvelope::from_text(&serialized).expect("storage round-trip");
 
     println!(
-        "p9_tracker stage12 storage-v2: tempo={}, restored_tempo={}, ticks={}, playing={}, events={}, audio_events={}, midi_events={}, processed_commands={}, backend={}, fallback={}, callbacks={}, xruns={}, last_callback_us={}, avg_callback_us={}, sample_rate={}, buffer_size={}, active_voices={}, max_voices={}, voice_steals={}",
+        "p9_tracker stage13 ui-alpha: tempo={}, restored_tempo={}, ticks={}, playing={}, events={}, audio_events={}, midi_events={}, processed_commands={}, backend={}, fallback={}, callbacks={}, xruns={}, last_callback_us={}, avg_callback_us={}, sample_rate={}, buffer_size={}, active_voices={}, max_voices={}, voice_steals={}, ui_screen={:?}, ui_track={}, ui_song_row={}, ui_chain_row={}, ui_phrase={}, ui_step={}, ui_scale_highlight={:?}, ui_track_level={}",
         envelope.project.song.tempo,
         restored.project.song.tempo,
         transport.tick,
@@ -183,8 +271,26 @@ fn main() {
         last_audio_metrics.buffer_size_frames,
         last_audio_metrics.active_voices,
         last_audio_metrics.max_voices,
-        last_voice_steals
+        last_voice_steals,
+        ui_snapshot.screen,
+        ui_snapshot.focused_track,
+        ui_snapshot.selected_song_row,
+        ui_snapshot.selected_chain_row,
+        ui_snapshot.selected_phrase_id,
+        ui_snapshot.selected_step,
+        ui_snapshot.scale_highlight,
+        ui_snapshot.focused_track_level,
     );
+}
+
+fn apply_ui(
+    ui: &mut UiController,
+    engine: &mut Engine,
+    runtime: &mut RuntimeCoordinator,
+    action: UiAction,
+) {
+    ui.handle_action(action, engine, runtime)
+        .expect("ui action failed");
 }
 
 fn major_scale_mask() -> u16 {

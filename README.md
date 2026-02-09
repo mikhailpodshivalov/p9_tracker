@@ -2,7 +2,7 @@
 
 ## Status
 
-- Current stage: `Phase 12 storage v2 + migration completed`
+- Current stage: `Phase 13 UI alpha workflow completed`
 - Main implementation stack: `Rust`
 
 ## Phase 1 Artifacts
@@ -57,6 +57,10 @@
 ## Phase 12 Artifacts
 
 - `docs/phase12_storage_v2.md`
+
+## Phase 13 Artifacts
+
+- `docs/phase13_ui_alpha.md`
 
 ## Forward Plan
 
