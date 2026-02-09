@@ -2,7 +2,9 @@ mod runtime;
 
 use p9_core::engine::{Engine, EngineCommand};
 use p9_core::model::{Chain, Groove, Instrument, InstrumentType, Phrase, Scale};
-use p9_rt::audio::{AudioBackend, NoopAudioBackend};
+use p9_rt::audio::{
+    build_preferred_audio_backend, start_with_noop_fallback, AudioMetrics,
+};
 use p9_rt::midi::{NoopMidiInput, NoopMidiOutput};
 use p9_storage::project::ProjectEnvelope;
 use runtime::{RuntimeCommand, RuntimeCoordinator};
@@ -78,8 +80,9 @@ fn main() {
         chain_id: Some(0),
     });
 
-    let mut audio = NoopAudioBackend::default();
-    audio.start();
+    let mut started_audio = start_with_noop_fallback(build_preferred_audio_backend(true));
+    let audio_backend_name = started_audio.backend().backend_name();
+    let audio_used_fallback = started_audio.used_fallback;
 
     let mut runtime = RuntimeCoordinator::new(24);
     runtime.enqueue_commands([RuntimeCommand::Rewind, RuntimeCommand::Start]);
@@ -88,14 +91,27 @@ fn main() {
     let mut midi_output = NoopMidiOutput::default();
     let mut events_total = 0usize;
     let mut midi_total = 0usize;
+    let mut last_audio_metrics = AudioMetrics::default();
 
     for _ in 0..24 {
         let _mapped = runtime.ingest_midi_input(&mut midi_input);
-        let report = runtime.run_tick(&engine, &mut audio, &mut midi_output);
+        let report = runtime.run_tick(
+            &engine,
+            started_audio.backend_mut(),
+            &mut midi_output,
+        );
         events_total = events_total.saturating_add(report.events_emitted);
         midi_total = midi_total.saturating_add(report.midi_messages_sent);
+        last_audio_metrics = AudioMetrics {
+            sample_rate_hz: report.audio_sample_rate_hz,
+            buffer_size_frames: report.audio_buffer_size_frames,
+            callbacks_total: report.audio_callbacks_total,
+            xruns_total: report.audio_xruns_total,
+            last_callback_us: report.audio_last_callback_us,
+            avg_callback_us: report.audio_avg_callback_us,
+        };
     }
-    audio.stop();
+    started_audio.backend_mut().stop();
     let transport = runtime.snapshot();
 
     let envelope = ProjectEnvelope::new(engine.snapshot().clone());
@@ -104,15 +120,23 @@ fn main() {
     let restored = ProjectEnvelope::from_text(&serialized).expect("storage round-trip");
 
     println!(
-        "p9_tracker stage8 runtime: tempo={}, restored_tempo={}, ticks={}, playing={}, events={}, audio_events={}, midi_events={}, processed_commands={}",
+        "p9_tracker stage9 audio: tempo={}, restored_tempo={}, ticks={}, playing={}, events={}, audio_events={}, midi_events={}, processed_commands={}, backend={}, fallback={}, callbacks={}, xruns={}, last_callback_us={}, avg_callback_us={}, sample_rate={}, buffer_size={}",
         envelope.project.song.tempo,
         restored.project.song.tempo,
         transport.tick,
         transport.is_playing,
         events_total,
-        audio.events_consumed(),
+        started_audio.backend().events_consumed(),
         midi_total,
-        transport.processed_commands
+        transport.processed_commands,
+        audio_backend_name,
+        audio_used_fallback,
+        last_audio_metrics.callbacks_total,
+        last_audio_metrics.xruns_total,
+        last_audio_metrics.last_callback_us,
+        last_audio_metrics.avg_callback_us,
+        last_audio_metrics.sample_rate_hz,
+        last_audio_metrics.buffer_size_frames
     );
 }
 

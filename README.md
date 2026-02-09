@@ -2,7 +2,7 @@
 
 ## Status
 
-- Current stage: `Phase 8 realtime runtime loop completed`
+- Current stage: `Phase 9 audio backend + metrics completed`
 - Main implementation stack: `Rust`
 
 ## Phase 1 Artifacts
@@ -41,6 +41,10 @@
 ## Phase 8 Artifacts
 
 - `docs/phase8_realtime_runtime.md`
+
+## Phase 9 Artifacts
+
+- `docs/phase9_audio_backend.md`
 
 ## Forward Plan
 

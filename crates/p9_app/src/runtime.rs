@@ -21,6 +21,13 @@ pub struct TickReport {
     pub midi_messages_sent: usize,
     pub tick: u64,
     pub is_playing: bool,
+    pub audio_backend: &'static str,
+    pub audio_callbacks_total: u64,
+    pub audio_xruns_total: u64,
+    pub audio_last_callback_us: u32,
+    pub audio_avg_callback_us: u32,
+    pub audio_buffer_size_frames: u32,
+    pub audio_sample_rate_hz: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -95,12 +102,20 @@ impl RuntimeCoordinator {
         let events = self.scheduler.tick(engine);
         audio.push_events(&events);
         let midi_messages_sent = forward_render_events(&events, midi_output);
+        let audio_metrics = audio.metrics();
 
         TickReport {
             events_emitted: events.len(),
             midi_messages_sent,
             tick: self.scheduler.current_tick,
             is_playing: self.scheduler.is_playing,
+            audio_backend: audio.backend_name(),
+            audio_callbacks_total: audio_metrics.callbacks_total,
+            audio_xruns_total: audio_metrics.xruns_total,
+            audio_last_callback_us: audio_metrics.last_callback_us,
+            audio_avg_callback_us: audio_metrics.avg_callback_us,
+            audio_buffer_size_frames: audio_metrics.buffer_size_frames,
+            audio_sample_rate_hz: audio_metrics.sample_rate_hz,
         }
     }
 
@@ -135,7 +150,7 @@ mod tests {
     use super::{RuntimeCommand, RuntimeCoordinator};
     use p9_core::engine::{Engine, EngineCommand};
     use p9_core::model::{Chain, Phrase};
-    use p9_rt::audio::{AudioBackend, NoopAudioBackend};
+    use p9_rt::audio::{AudioBackend, AudioBackendConfig, NativeAudioBackend, NoopAudioBackend};
     use p9_rt::midi::{MidiMessage, NoopMidiOutput};
 
     fn setup_engine() -> Engine {
@@ -273,5 +288,28 @@ mod tests {
         }
 
         assert_eq!(run_sequence(), run_sequence());
+    }
+
+    #[test]
+    fn tick_report_exposes_audio_metrics() {
+        let engine = setup_engine();
+        let mut runtime = RuntimeCoordinator::new(4);
+        let mut audio = NativeAudioBackend::new(AudioBackendConfig {
+            max_callback_us: 150,
+            base_callback_us: 200,
+            per_event_us: 0,
+            ..AudioBackendConfig::default()
+        });
+        audio.start_checked().unwrap();
+        let mut midi_out = NoopMidiOutput::default();
+
+        let report = runtime.run_tick(&engine, &mut audio, &mut midi_out);
+
+        assert_eq!(report.audio_backend, "native-simulated-linux");
+        assert_eq!(report.audio_callbacks_total, 1);
+        assert_eq!(report.audio_xruns_total, 1);
+        assert_eq!(report.audio_last_callback_us, 200);
+        assert_eq!(report.audio_sample_rate_hz, 48_000);
+        assert_eq!(report.audio_buffer_size_frames, 256);
     }
 }
