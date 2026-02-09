@@ -21,6 +21,33 @@ pub enum InstrumentType {
     External,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SynthWaveform {
+    Sine,
+    Square,
+    Saw,
+    Triangle,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct SynthParams {
+    pub waveform: SynthWaveform,
+    pub attack_ms: u16,
+    pub release_ms: u16,
+    pub gain: u8,
+}
+
+impl Default for SynthParams {
+    fn default() -> Self {
+        Self {
+            waveform: SynthWaveform::Saw,
+            attack_ms: 5,
+            release_ms: 80,
+            gain: 100,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Song {
     pub name: String,
@@ -132,6 +159,8 @@ pub struct Instrument {
     pub name: String,
     pub send_levels: SendLevels,
     pub table_id: Option<TableId>,
+    pub note_length_steps: u8,
+    pub synth_params: SynthParams,
 }
 
 impl Instrument {
@@ -142,6 +171,8 @@ impl Instrument {
             name: name.into(),
             send_levels: SendLevels::default(),
             table_id: None,
+            note_length_steps: 1,
+            synth_params: SynthParams::default(),
         }
     }
 }

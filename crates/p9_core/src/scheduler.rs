@@ -1,7 +1,8 @@
 use crate::engine::Engine;
 use crate::events::RenderEvent;
 use crate::model::{
-    ChainId, ProjectData, Scale, PHRASE_STEP_COUNT, SONG_ROW_COUNT, TRACK_COUNT,
+    ChainId, InstrumentId, ProjectData, Scale, SynthParams, PHRASE_STEP_COUNT, SONG_ROW_COUNT,
+    TRACK_COUNT,
 };
 
 #[derive(Clone, Debug, Default)]
@@ -10,6 +11,18 @@ pub struct TrackPlaybackState {
     pub chain_row: usize,
     pub phrase_step: usize,
     pub tick_in_step: u8,
+    pub active_note: Option<u8>,
+    pub note_steps_remaining: Option<u8>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct StepPlaybackData {
+    track_id: u8,
+    note: u8,
+    velocity: u8,
+    instrument_id: Option<InstrumentId>,
+    note_length_steps: u8,
+    synth_params: SynthParams,
 }
 
 pub struct Scheduler {
@@ -58,6 +71,7 @@ impl Scheduler {
 
         for track_index in 0..project.song.tracks.len() {
             if !self.track_is_audible(project, track_index) {
+                self.force_note_off_if_active(project, track_index, &mut out);
                 self.advance_one_tick(project, track_index);
                 continue;
             }
@@ -65,9 +79,7 @@ impl Scheduler {
             self.ensure_playable_position(project, track_index);
 
             if self.track_state[track_index].tick_in_step == 0 {
-                if let Some(event) = self.resolve_step_event(project, track_index) {
-                    out.push(event);
-                }
+                self.process_step_boundary(project, track_index, &mut out);
             }
 
             self.advance_one_tick(project, track_index);
@@ -104,7 +116,89 @@ impl Scheduler {
         state.tick_in_step = 0;
     }
 
-    fn resolve_step_event(&self, project: &ProjectData, track_index: usize) -> Option<RenderEvent> {
+    fn process_step_boundary(
+        &mut self,
+        project: &ProjectData,
+        track_index: usize,
+        out: &mut Vec<RenderEvent>,
+    ) {
+        self.emit_scheduled_note_off(project, track_index, out);
+
+        let Some(step_data) = self.resolve_step_data(project, track_index) else {
+            return;
+        };
+
+        self.force_note_off_if_active(project, track_index, out);
+
+        out.push(RenderEvent::NoteOn {
+            track_id: step_data.track_id,
+            note: step_data.note,
+            velocity: step_data.velocity,
+            instrument_id: step_data.instrument_id,
+            waveform: step_data.synth_params.waveform,
+            attack_ms: step_data.synth_params.attack_ms,
+            release_ms: step_data.synth_params.release_ms,
+            gain: step_data.synth_params.gain,
+        });
+
+        let state = &mut self.track_state[track_index];
+        state.active_note = Some(step_data.note);
+        state.note_steps_remaining = Some(step_data.note_length_steps.max(1));
+    }
+
+    fn emit_scheduled_note_off(
+        &mut self,
+        project: &ProjectData,
+        track_index: usize,
+        out: &mut Vec<RenderEvent>,
+    ) {
+        let (track_id, active_note, note_steps_remaining) = {
+            let Some(track) = project.song.tracks.get(track_index) else {
+                return;
+            };
+            let state = &self.track_state[track_index];
+            (track.index, state.active_note, state.note_steps_remaining)
+        };
+
+        let (Some(note), Some(remaining)) = (active_note, note_steps_remaining) else {
+            return;
+        };
+
+        if remaining <= 1 {
+            out.push(RenderEvent::NoteOff { track_id, note });
+            let state = &mut self.track_state[track_index];
+            state.active_note = None;
+            state.note_steps_remaining = None;
+        } else {
+            self.track_state[track_index].note_steps_remaining = Some(remaining - 1);
+        }
+    }
+
+    fn force_note_off_if_active(
+        &mut self,
+        project: &ProjectData,
+        track_index: usize,
+        out: &mut Vec<RenderEvent>,
+    ) {
+        let active_note = self.track_state[track_index].active_note;
+        let Some(note) = active_note else {
+            return;
+        };
+
+        let Some(track) = project.song.tracks.get(track_index) else {
+            return;
+        };
+
+        out.push(RenderEvent::NoteOff {
+            track_id: track.index,
+            note,
+        });
+        let state = &mut self.track_state[track_index];
+        state.active_note = None;
+        state.note_steps_remaining = None;
+    }
+
+    fn resolve_step_data(&self, project: &ProjectData, track_index: usize) -> Option<StepPlaybackData> {
         let track = project.song.tracks.get(track_index)?;
         let state = self.track_state.get(track_index)?;
 
@@ -117,13 +211,39 @@ impl Scheduler {
 
         let note = step.note.map(|raw_note| Self::apply_transpose(raw_note, chain_row.transpose))?;
         let note = self.apply_scale(project, track_index, note);
+        let note_length_steps = self.resolve_note_length_steps(project, step.instrument_id);
+        let synth_params = self.resolve_synth_params(project, step.instrument_id);
 
-        Some(RenderEvent::NoteOn {
+        Some(StepPlaybackData {
             track_id: track.index,
             note,
             velocity: step.velocity,
             instrument_id: step.instrument_id,
+            note_length_steps,
+            synth_params,
         })
+    }
+
+    fn resolve_note_length_steps(
+        &self,
+        project: &ProjectData,
+        instrument_id: Option<InstrumentId>,
+    ) -> u8 {
+        instrument_id
+            .and_then(|id| project.instruments.get(&id))
+            .map(|inst| inst.note_length_steps.max(1))
+            .unwrap_or(1)
+    }
+
+    fn resolve_synth_params(
+        &self,
+        project: &ProjectData,
+        instrument_id: Option<InstrumentId>,
+    ) -> SynthParams {
+        instrument_id
+            .and_then(|id| project.instruments.get(&id))
+            .map(|inst| inst.synth_params)
+            .unwrap_or_default()
     }
 
     fn apply_transpose(note: u8, transpose: i8) -> u8 {
@@ -321,7 +441,7 @@ mod tests {
     use super::Scheduler;
     use crate::engine::{Engine, EngineCommand};
     use crate::events::RenderEvent;
-    use crate::model::{Chain, Groove, Phrase, Scale};
+    use crate::model::{Chain, Groove, Instrument, InstrumentType, Phrase, Scale};
 
     fn setup_engine() -> Engine {
         let mut engine = Engine::new("test");
@@ -361,7 +481,8 @@ mod tests {
         let second = scheduler.tick(&engine);
 
         assert_eq!(first.len(), 1);
-        assert_eq!(second.len(), 1);
+        assert_eq!(count_note_on(&second), 1);
+        assert_eq!(count_note_off(&second), 1);
     }
 
     #[test]
@@ -417,9 +538,10 @@ mod tests {
         let t4 = scheduler.tick(&engine);
 
         assert_eq!(t1.len(), 1);
-        assert_eq!(t2.len(), 0);
+        assert_eq!(count_note_on(&t2), 0);
+        assert_eq!(count_note_off(&t2), 1);
         assert_eq!(t3.len(), 0);
-        assert_eq!(t4.len(), 1);
+        assert_eq!(count_note_on(&t4), 1);
     }
 
     #[test]
@@ -457,7 +579,8 @@ mod tests {
         let t2 = scheduler.tick(&engine);
 
         assert_eq!(t1.len(), 1);
-        assert_eq!(t2.len(), 1);
+        assert_eq!(count_note_on(&t2), 1);
+        assert_eq!(count_note_off(&t2), 1);
     }
 
     #[test]
@@ -541,6 +664,99 @@ mod tests {
             RenderEvent::NoteOn { note, .. } => assert_eq!(*note, 61),
             _ => panic!("expected note on"),
         }
+    }
+
+    #[test]
+    fn emits_note_off_after_one_step_by_default() {
+        let mut engine = setup_engine();
+        engine
+            .apply_command(EngineCommand::SetPhraseStep {
+                phrase_id: 0,
+                step_index: 1,
+                note: None,
+                velocity: 90,
+                instrument_id: None,
+            })
+            .unwrap();
+
+        let mut scheduler = Scheduler::new(4);
+        let t1 = scheduler.tick(&engine);
+        let t2 = scheduler.tick(&engine);
+
+        assert_eq!(count_note_on(&t1), 1);
+        assert_eq!(count_note_off(&t1), 0);
+        assert_eq!(count_note_off(&t2), 1);
+    }
+
+    #[test]
+    fn respects_instrument_note_length_steps() {
+        let mut engine = setup_engine();
+        let mut instrument = Instrument::new(0, InstrumentType::Synth, "Long");
+        instrument.note_length_steps = 3;
+        engine
+            .apply_command(EngineCommand::UpsertInstrument { instrument })
+            .unwrap();
+        engine
+            .apply_command(EngineCommand::SetPhraseStep {
+                phrase_id: 0,
+                step_index: 0,
+                note: Some(60),
+                velocity: 100,
+                instrument_id: Some(0),
+            })
+            .unwrap();
+        engine
+            .apply_command(EngineCommand::SetPhraseStep {
+                phrase_id: 0,
+                step_index: 1,
+                note: None,
+                velocity: 90,
+                instrument_id: Some(0),
+            })
+            .unwrap();
+        engine
+            .apply_command(EngineCommand::SetPhraseStep {
+                phrase_id: 0,
+                step_index: 2,
+                note: None,
+                velocity: 90,
+                instrument_id: Some(0),
+            })
+            .unwrap();
+        engine
+            .apply_command(EngineCommand::SetPhraseStep {
+                phrase_id: 0,
+                step_index: 3,
+                note: None,
+                velocity: 90,
+                instrument_id: Some(0),
+            })
+            .unwrap();
+
+        let mut scheduler = Scheduler::new(4);
+        let t1 = scheduler.tick(&engine);
+        let t2 = scheduler.tick(&engine);
+        let t3 = scheduler.tick(&engine);
+        let t4 = scheduler.tick(&engine);
+
+        assert_eq!(count_note_on(&t1), 1);
+        assert_eq!(count_note_off(&t2), 0);
+        assert_eq!(count_note_off(&t3), 0);
+        assert_eq!(count_note_off(&t4), 1);
+    }
+
+    fn count_note_on(events: &[RenderEvent]) -> usize {
+        events
+            .iter()
+            .filter(|event| matches!(event, RenderEvent::NoteOn { .. }))
+            .count()
+    }
+
+    fn count_note_off(events: &[RenderEvent]) -> usize {
+        events
+            .iter()
+            .filter(|event| matches!(event, RenderEvent::NoteOff { .. }))
+            .count()
     }
 
     fn major_scale_mask() -> u16 {

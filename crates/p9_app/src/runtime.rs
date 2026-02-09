@@ -28,6 +28,9 @@ pub struct TickReport {
     pub audio_avg_callback_us: u32,
     pub audio_buffer_size_frames: u32,
     pub audio_sample_rate_hz: u32,
+    pub audio_active_voices: u32,
+    pub audio_max_voices: u32,
+    pub audio_voices_stolen_total: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -116,6 +119,9 @@ impl RuntimeCoordinator {
             audio_avg_callback_us: audio_metrics.avg_callback_us,
             audio_buffer_size_frames: audio_metrics.buffer_size_frames,
             audio_sample_rate_hz: audio_metrics.sample_rate_hz,
+            audio_active_voices: audio_metrics.active_voices,
+            audio_max_voices: audio_metrics.max_voices,
+            audio_voices_stolen_total: audio_metrics.voices_stolen_total,
         }
     }
 
@@ -311,5 +317,7 @@ mod tests {
         assert_eq!(report.audio_last_callback_us, 200);
         assert_eq!(report.audio_sample_rate_hz, 48_000);
         assert_eq!(report.audio_buffer_size_frames, 256);
+        assert_eq!(report.audio_max_voices, 16);
+        assert_eq!(report.audio_active_voices, 1);
     }
 }

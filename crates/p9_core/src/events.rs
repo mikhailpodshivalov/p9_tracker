@@ -1,4 +1,4 @@
-use crate::model::InstrumentId;
+use crate::model::{InstrumentId, SynthWaveform};
 
 #[derive(Clone, Debug)]
 pub enum RenderEvent {
@@ -7,6 +7,10 @@ pub enum RenderEvent {
         note: u8,
         velocity: u8,
         instrument_id: Option<InstrumentId>,
+        waveform: SynthWaveform,
+        attack_ms: u16,
+        release_ms: u16,
+        gain: u8,
     },
     NoteOff {
         track_id: u8,

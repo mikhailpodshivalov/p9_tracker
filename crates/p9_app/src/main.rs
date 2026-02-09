@@ -92,6 +92,7 @@ fn main() {
     let mut events_total = 0usize;
     let mut midi_total = 0usize;
     let mut last_audio_metrics = AudioMetrics::default();
+    let mut last_voice_steals = 0u64;
 
     for _ in 0..24 {
         let _mapped = runtime.ingest_midi_input(&mut midi_input);
@@ -109,7 +110,11 @@ fn main() {
             xruns_total: report.audio_xruns_total,
             last_callback_us: report.audio_last_callback_us,
             avg_callback_us: report.audio_avg_callback_us,
+            active_voices: report.audio_active_voices,
+            max_voices: report.audio_max_voices,
+            voices_stolen_total: report.audio_voices_stolen_total,
         };
+        last_voice_steals = report.audio_voices_stolen_total;
     }
     started_audio.backend_mut().stop();
     let transport = runtime.snapshot();
@@ -120,7 +125,7 @@ fn main() {
     let restored = ProjectEnvelope::from_text(&serialized).expect("storage round-trip");
 
     println!(
-        "p9_tracker stage9 audio: tempo={}, restored_tempo={}, ticks={}, playing={}, events={}, audio_events={}, midi_events={}, processed_commands={}, backend={}, fallback={}, callbacks={}, xruns={}, last_callback_us={}, avg_callback_us={}, sample_rate={}, buffer_size={}",
+        "p9_tracker stage10 voice: tempo={}, restored_tempo={}, ticks={}, playing={}, events={}, audio_events={}, midi_events={}, processed_commands={}, backend={}, fallback={}, callbacks={}, xruns={}, last_callback_us={}, avg_callback_us={}, sample_rate={}, buffer_size={}, active_voices={}, max_voices={}, voice_steals={}",
         envelope.project.song.tempo,
         restored.project.song.tempo,
         transport.tick,
@@ -136,7 +141,10 @@ fn main() {
         last_audio_metrics.last_callback_us,
         last_audio_metrics.avg_callback_us,
         last_audio_metrics.sample_rate_hz,
-        last_audio_metrics.buffer_size_frames
+        last_audio_metrics.buffer_size_frames,
+        last_audio_metrics.active_voices,
+        last_audio_metrics.max_voices,
+        last_voice_steals
     );
 }
 

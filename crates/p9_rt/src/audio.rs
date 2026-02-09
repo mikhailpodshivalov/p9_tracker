@@ -1,4 +1,5 @@
 use crate::dsp::DspPipeline;
+use crate::voice::VoiceAllocator;
 use p9_core::events::RenderEvent;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -9,6 +10,9 @@ pub struct AudioMetrics {
     pub xruns_total: u64,
     pub last_callback_us: u32,
     pub avg_callback_us: u32,
+    pub active_voices: u32,
+    pub max_voices: u32,
+    pub voices_stolen_total: u64,
 }
 
 impl Default for AudioMetrics {
@@ -20,6 +24,9 @@ impl Default for AudioMetrics {
             xruns_total: 0,
             last_callback_us: 0,
             avg_callback_us: 0,
+            active_voices: 0,
+            max_voices: 0,
+            voices_stolen_total: 0,
         }
     }
 }
@@ -31,6 +38,7 @@ pub struct AudioBackendConfig {
     pub base_callback_us: u32,
     pub per_event_us: u32,
     pub max_callback_us: u32,
+    pub max_voices: usize,
     pub fail_on_start: bool,
 }
 
@@ -42,6 +50,7 @@ impl Default for AudioBackendConfig {
             base_callback_us: 220,
             per_event_us: 35,
             max_callback_us: 1_200,
+            max_voices: 16,
             fail_on_start: false,
         }
     }
@@ -108,6 +117,7 @@ pub struct NativeAudioBackend {
     metrics: AudioMetrics,
     callback_us_total: u64,
     dsp: DspPipeline,
+    voices: VoiceAllocator,
 }
 
 impl NativeAudioBackend {
@@ -118,10 +128,12 @@ impl NativeAudioBackend {
             metrics: AudioMetrics {
                 sample_rate_hz: config.sample_rate_hz,
                 buffer_size_frames: config.buffer_size_frames,
+                max_voices: config.max_voices as u32,
                 ..AudioMetrics::default()
             },
             callback_us_total: 0,
             dsp: DspPipeline::new(config.max_callback_us),
+            voices: VoiceAllocator::new(config.max_voices),
             config,
         }
     }
@@ -157,6 +169,35 @@ impl AudioBackend for NativeAudioBackend {
             return;
         }
 
+        for event in events {
+            match event {
+                RenderEvent::NoteOn {
+                    track_id,
+                    note,
+                    velocity,
+                    instrument_id,
+                    waveform,
+                    attack_ms,
+                    release_ms,
+                    gain,
+                } => {
+                    self.voices.note_on(
+                        *track_id,
+                        *note,
+                        *velocity,
+                        *instrument_id,
+                        *waveform,
+                        *attack_ms,
+                        *release_ms,
+                        *gain,
+                    );
+                }
+                RenderEvent::NoteOff { track_id, note } => {
+                    let _ = self.voices.note_off(*track_id, *note);
+                }
+            }
+        }
+
         let simulated_callback_us = self.config.base_callback_us.saturating_add(
             (events.len() as u32).saturating_mul(self.config.per_event_us),
         );
@@ -175,6 +216,9 @@ impl AudioBackend for NativeAudioBackend {
             .saturating_add(dsp_stats.block_us as u64);
         let callbacks = self.metrics.callbacks_total.max(1);
         self.metrics.avg_callback_us = (self.callback_us_total / callbacks) as u32;
+        self.metrics.active_voices = self.voices.active_voice_count() as u32;
+        self.metrics.max_voices = self.voices.max_voices() as u32;
+        self.metrics.voices_stolen_total = self.voices.voices_stolen_total();
     }
 
     fn events_consumed(&self) -> usize {
@@ -235,6 +279,20 @@ mod tests {
         start_with_noop_fallback, AudioBackend, AudioBackendConfig, NativeAudioBackend,
     };
     use p9_core::events::RenderEvent;
+    use p9_core::model::SynthWaveform;
+
+    fn note_on(track_id: u8, note: u8) -> RenderEvent {
+        RenderEvent::NoteOn {
+            track_id,
+            note,
+            velocity: 100,
+            instrument_id: Some(0),
+            waveform: SynthWaveform::Saw,
+            attack_ms: 5,
+            release_ms: 80,
+            gain: 100,
+        }
+    }
 
     #[test]
     fn native_backend_collects_callback_and_xrun_metrics() {
@@ -246,12 +304,7 @@ mod tests {
         });
         backend.start_checked().unwrap();
 
-        backend.push_events(&[RenderEvent::NoteOn {
-            track_id: 0,
-            note: 60,
-            velocity: 100,
-            instrument_id: Some(0),
-        }]);
+        backend.push_events(&[note_on(0, 60)]);
         backend.push_events(&[]);
 
         let metrics = backend.metrics();
@@ -259,6 +312,8 @@ mod tests {
         assert_eq!(metrics.xruns_total, 1);
         assert_eq!(metrics.last_callback_us, 200);
         assert_eq!(metrics.avg_callback_us, 250);
+        assert_eq!(metrics.active_voices, 1);
+        assert_eq!(metrics.max_voices, 16);
     }
 
     #[test]
@@ -271,5 +326,23 @@ mod tests {
         let started = start_with_noop_fallback(primary);
         assert!(started.used_fallback);
         assert_eq!(started.backend().backend_name(), "noop");
+    }
+
+    #[test]
+    fn voice_allocator_stays_bounded_in_native_backend() {
+        let mut backend = NativeAudioBackend::new(AudioBackendConfig {
+            max_voices: 2,
+            ..AudioBackendConfig::default()
+        });
+        backend.start_checked().unwrap();
+
+        backend.push_events(&[note_on(0, 60)]);
+        backend.push_events(&[note_on(0, 62)]);
+        backend.push_events(&[note_on(0, 64)]);
+
+        let metrics = backend.metrics();
+        assert_eq!(metrics.max_voices, 2);
+        assert_eq!(metrics.active_voices, 2);
+        assert_eq!(metrics.voices_stolen_total, 1);
     }
 }

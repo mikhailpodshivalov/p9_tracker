@@ -2,7 +2,7 @@
 
 ## Status
 
-- Current stage: `Phase 9 audio backend + metrics completed`
+- Current stage: `Phase 10 voice engine + instrument v1 completed`
 - Main implementation stack: `Rust`
 
 ## Phase 1 Artifacts
@@ -45,6 +45,10 @@
 ## Phase 9 Artifacts
 
 - `docs/phase9_audio_backend.md`
+
+## Phase 10 Artifacts
+
+- `docs/phase10_voice_engine.md`
 
 ## Forward Plan
 

@@ -127,6 +127,20 @@ mod tests {
     };
     use crate::midi::MidiOutput;
     use p9_core::events::RenderEvent;
+    use p9_core::model::SynthWaveform;
+
+    fn note_on(track_id: u8, note: u8, velocity: u8) -> RenderEvent {
+        RenderEvent::NoteOn {
+            track_id,
+            note,
+            velocity,
+            instrument_id: Some(0),
+            waveform: SynthWaveform::Saw,
+            attack_ms: 5,
+            release_ms: 80,
+            gain: 100,
+        }
+    }
 
     #[test]
     fn decode_note_messages() {
@@ -181,12 +195,7 @@ mod tests {
 
     #[test]
     fn render_event_maps_track_to_channel() {
-        let msg = render_event_to_midi(&RenderEvent::NoteOn {
-            track_id: 19,
-            note: 72,
-            velocity: 90,
-            instrument_id: Some(1),
-        });
+        let msg = render_event_to_midi(&note_on(19, 72, 90));
 
         assert_eq!(
             msg,
@@ -201,12 +210,7 @@ mod tests {
     #[test]
     fn forward_render_events_sends_all_messages() {
         let events = vec![
-            RenderEvent::NoteOn {
-                track_id: 0,
-                note: 60,
-                velocity: 100,
-                instrument_id: Some(0),
-            },
+            note_on(0, 60, 100),
             RenderEvent::NoteOff {
                 track_id: 0,
                 note: 60,
