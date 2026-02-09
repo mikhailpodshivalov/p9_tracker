@@ -2,7 +2,7 @@
 
 ## Status
 
-- Current stage: `Phase 15.4 UX safety + smoke completed`
+- Current stage: `Phase 16.1 undo/redo foundation completed`
 - Main implementation stack: `Rust`
 
 ## Phase 1 Artifacts
@@ -81,6 +81,11 @@
 ## Phase 15.4 Artifacts
 
 - `docs/phase15_4_ux_safety_smoke.md`
+
+## Phase 16 Artifacts
+
+- `docs/phase16_plan.md`
+- `docs/phase16_1_undo_redo_foundation.md`
 
 ## Forward Plan
 

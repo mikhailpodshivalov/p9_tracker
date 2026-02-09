@@ -118,6 +118,10 @@ impl Engine {
         &self.project
     }
 
+    pub fn replace_project(&mut self, project: ProjectData) {
+        self.project = project;
+    }
+
     pub fn apply_command(&mut self, command: EngineCommand) -> Result<(), EngineError> {
         match command {
             EngineCommand::SetTempo(tempo) => {

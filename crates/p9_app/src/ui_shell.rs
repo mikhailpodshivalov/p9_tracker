@@ -10,6 +10,7 @@ use p9_rt::midi::NoopMidiOutput;
 const SONG_VIEW_ROWS: usize = 8;
 const CHAIN_VIEW_ROWS: usize = 8;
 const PHRASE_COLS: usize = 4;
+const HISTORY_LIMIT: usize = 128;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ShellCommandResult {
@@ -17,15 +18,62 @@ pub enum ShellCommandResult {
     Exit,
 }
 
+#[derive(Clone, Debug)]
+pub struct ProjectHistory {
+    undo_stack: Vec<ProjectData>,
+    redo_stack: Vec<ProjectData>,
+    limit: usize,
+}
+
+impl ProjectHistory {
+    pub fn with_limit(limit: usize) -> Self {
+        Self {
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            limit: limit.max(1),
+        }
+    }
+
+    pub fn record_change(&mut self, previous: ProjectData) {
+        if self.undo_stack.len() >= self.limit {
+            let overflow = self.undo_stack.len() + 1 - self.limit;
+            self.undo_stack.drain(0..overflow);
+        }
+        self.undo_stack.push(previous);
+        self.redo_stack.clear();
+    }
+
+    pub fn undo(&mut self, engine: &mut Engine) -> bool {
+        let Some(previous) = self.undo_stack.pop() else {
+            return false;
+        };
+
+        self.redo_stack.push(engine.snapshot().clone());
+        engine.replace_project(previous);
+        true
+    }
+
+    pub fn redo(&mut self, engine: &mut Engine) -> bool {
+        let Some(next) = self.redo_stack.pop() else {
+            return false;
+        };
+
+        self.undo_stack.push(engine.snapshot().clone());
+        engine.replace_project(next);
+        true
+    }
+}
+
 pub fn run_interactive_shell(
     ui: &mut UiController,
     engine: &mut Engine,
     runtime: &mut RuntimeCoordinator,
 ) -> io::Result<()> {
-    let mut status = String::from("Shell ready. Commands: n/p/h/l/j/k/t/r/c/f/i/e/+/-/?/q");
+    let mut status = String::from("Shell ready. Commands: n/p/h/l/j/k/t/r/c/f/i/e/+/-/u/y/?/q");
     let mut audio = NoopAudioBackend::default();
     audio.start();
     let mut midi_output = NoopMidiOutput::default();
+    let mut history = ProjectHistory::with_limit(HISTORY_LIMIT);
 
     loop {
         let snapshot = ui.snapshot(engine, runtime);
@@ -40,7 +88,13 @@ pub fn run_interactive_shell(
             break;
         }
 
-        match apply_shell_command(line.trim(), ui, engine, runtime) {
+        match apply_shell_command_with_history(
+            line.trim(),
+            ui,
+            engine,
+            runtime,
+            &mut history,
+        ) {
             Ok(ShellCommandResult::Continue(next_status)) => {
                 status = match runtime.run_tick_safe(engine, &mut audio, &mut midi_output) {
                     Ok(report) => format!(
@@ -62,6 +116,52 @@ pub fn run_interactive_shell(
     }
 
     Ok(())
+}
+
+pub fn apply_shell_command_with_history(
+    command: &str,
+    ui: &mut UiController,
+    engine: &mut Engine,
+    runtime: &mut RuntimeCoordinator,
+    history: &mut ProjectHistory,
+) -> Result<ShellCommandResult, UiError> {
+    match command {
+        "u" => {
+            if history.undo(engine) {
+                Ok(ShellCommandResult::Continue(String::from("undo -> applied")))
+            } else {
+                Ok(ShellCommandResult::Continue(String::from(
+                    "undo -> empty history",
+                )))
+            }
+        }
+        "y" => {
+            if history.redo(engine) {
+                Ok(ShellCommandResult::Continue(String::from("redo -> applied")))
+            } else {
+                Ok(ShellCommandResult::Continue(String::from(
+                    "redo -> empty history",
+                )))
+            }
+        }
+        _ => {
+            let before = if is_mutating_command(command) {
+                Some(engine.snapshot().clone())
+            } else {
+                None
+            };
+
+            let result = apply_shell_command(command, ui, engine, runtime)?;
+
+            if let Some(previous) = before {
+                if command_did_mutate(&result) {
+                    history.record_change(previous);
+                }
+            }
+
+            Ok(result)
+        }
+    }
 }
 
 pub fn apply_shell_command(
@@ -239,7 +339,7 @@ pub fn apply_shell_command(
         "q" => Ok(ShellCommandResult::Exit),
         "" => Ok(ShellCommandResult::Continue(String::from("idle"))),
         _ => Ok(ShellCommandResult::Continue(String::from(
-            "unknown command; use n/p/h/l/j/k/t/r/c/f/i/e/+/-/?/q",
+            "unknown command; use n/p/h/l/j/k/t/r/c/f/i/e/+/-/u/y/?/q",
         ))),
     }
 }
@@ -247,7 +347,7 @@ pub fn apply_shell_command(
 pub fn render_frame(project: &ProjectData, snapshot: UiSnapshot, status: &str) -> String {
     let mut out = String::new();
 
-    out.push_str("P9 Tracker UI Shell (Phase 15.4)\n");
+    out.push_str("P9 Tracker UI Shell (Phase 16.1)\n");
     out.push_str("Screen Tabs: ");
     out.push_str(&tab(UiScreen::Song, snapshot.screen));
     out.push(' ');
@@ -285,7 +385,7 @@ pub fn render_frame(project: &ProjectData, snapshot: UiSnapshot, status: &str) -
     out.push_str("----------------------------------------------------------------\n");
     out.push_str(&format!("Status: {status}\n"));
     out.push_str(
-        "Commands: n/p screen, h/l track, j/k cursor, t play, r rewind, c/f/i/e edit, +/- level, ? help, q quit\n",
+        "Commands: n/p screen, h/l track, j/k cursor, t play, r rewind, c/f/i/e edit, +/- level, u/y undo-redo, ? help, q quit\n",
     );
 
     out
@@ -340,7 +440,15 @@ fn bound_phrase_id(project: &ProjectData, chain_id: u8, snapshot: UiSnapshot) ->
 }
 
 fn command_help() -> &'static str {
-    "help: n/p screen, h/l track, j/k cursor, t play/stop, r stop+rewind, c bind chain, f bind phrase, i ensure instrument, e edit step, +/- level"
+    "help: n/p screen, h/l track, j/k cursor, t play/stop, r stop+rewind, c bind chain, f bind phrase, i ensure instrument, e edit step, +/- level, u undo, y redo"
+}
+
+fn is_mutating_command(command: &str) -> bool {
+    matches!(command, "c" | "f" | "i" | "e" | "+" | "-")
+}
+
+fn command_did_mutate(result: &ShellCommandResult) -> bool {
+    matches!(result, ShellCommandResult::Continue(msg) if !msg.starts_with("warn:"))
 }
 
 fn wrap_next(current: usize, len: usize) -> usize {
@@ -511,7 +619,10 @@ fn render_mixer_panel(out: &mut String, project: &ProjectData, snapshot: UiSnaps
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_shell_command, render_frame, ShellCommandResult};
+    use super::{
+        apply_shell_command, apply_shell_command_with_history, render_frame, ProjectHistory,
+        ShellCommandResult,
+    };
     use crate::runtime::RuntimeCoordinator;
     use crate::ui::{UiController, UiScreen};
     use p9_core::engine::Engine;
@@ -527,7 +638,7 @@ mod tests {
         let snapshot = ui.snapshot(&engine, &runtime);
         let frame = render_frame(engine.snapshot(), snapshot, "ok");
 
-        assert!(frame.contains("P9 Tracker UI Shell (Phase 15.4)"));
+        assert!(frame.contains("P9 Tracker UI Shell (Phase 16.1)"));
         assert!(frame.contains("Screen Tabs:"));
         assert!(frame.contains("Song Panel"));
         assert!(frame.contains("Commands: n/p screen"));
@@ -703,5 +814,55 @@ mod tests {
 
         assert_eq!(report.events_emitted, 1);
         assert!(runtime.snapshot().is_playing);
+    }
+
+    #[test]
+    fn shell_undo_redo_restores_edit_state() {
+        let mut ui = UiController::default();
+        let mut engine = Engine::new("shell");
+        let mut runtime = RuntimeCoordinator::new(24);
+        let mut history = ProjectHistory::with_limit(32);
+
+        let _ = apply_shell_command_with_history("c", &mut ui, &mut engine, &mut runtime, &mut history)
+            .unwrap();
+        let _ = apply_shell_command_with_history("f", &mut ui, &mut engine, &mut runtime, &mut history)
+            .unwrap();
+        let _ = apply_shell_command_with_history("i", &mut ui, &mut engine, &mut runtime, &mut history)
+            .unwrap();
+        let _ = apply_shell_command_with_history("e", &mut ui, &mut engine, &mut runtime, &mut history)
+            .unwrap();
+        assert_eq!(engine.snapshot().phrases.get(&0).unwrap().steps[0].note, Some(60));
+
+        let undo = apply_shell_command_with_history("u", &mut ui, &mut engine, &mut runtime, &mut history)
+            .unwrap();
+        assert_eq!(undo, ShellCommandResult::Continue(String::from("undo -> applied")));
+        assert_eq!(engine.snapshot().phrases.get(&0).unwrap().steps[0].note, None);
+
+        let redo = apply_shell_command_with_history("y", &mut ui, &mut engine, &mut runtime, &mut history)
+            .unwrap();
+        assert_eq!(redo, ShellCommandResult::Continue(String::from("redo -> applied")));
+        assert_eq!(engine.snapshot().phrases.get(&0).unwrap().steps[0].note, Some(60));
+    }
+
+    #[test]
+    fn shell_undo_redo_reports_empty_history() {
+        let mut ui = UiController::default();
+        let mut engine = Engine::new("shell");
+        let mut runtime = RuntimeCoordinator::new(24);
+        let mut history = ProjectHistory::with_limit(8);
+
+        let undo = apply_shell_command_with_history("u", &mut ui, &mut engine, &mut runtime, &mut history)
+            .unwrap();
+        assert_eq!(
+            undo,
+            ShellCommandResult::Continue(String::from("undo -> empty history"))
+        );
+
+        let redo = apply_shell_command_with_history("y", &mut ui, &mut engine, &mut runtime, &mut history)
+            .unwrap();
+        assert_eq!(
+            redo,
+            ShellCommandResult::Continue(String::from("redo -> empty history"))
+        );
     }
 }
