@@ -2,7 +2,7 @@
 
 ## Status
 
-- Current stage: `Phase 7 MIDI bridge completed`
+- Current stage: `Phase 8 realtime runtime loop completed`
 - Main implementation stack: `Rust`
 
 ## Phase 1 Artifacts
@@ -37,6 +37,10 @@
 ## Phase 7 Artifacts
 
 - `docs/phase7_midi_bridge.md`
+
+## Phase 8 Artifacts
+
+- `docs/phase8_realtime_runtime.md`
 
 ## Forward Plan
 

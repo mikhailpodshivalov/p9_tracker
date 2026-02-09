@@ -1,11 +1,11 @@
+mod runtime;
+
 use p9_core::engine::{Engine, EngineCommand};
 use p9_core::model::{Chain, Groove, Instrument, InstrumentType, Phrase, Scale};
-use p9_core::scheduler::Scheduler;
 use p9_rt::audio::{AudioBackend, NoopAudioBackend};
-use p9_rt::midi::{
-    decode_message, forward_render_events, DecodedMidi, MidiInput, NoopMidiInput, NoopMidiOutput,
-};
+use p9_rt::midi::{NoopMidiInput, NoopMidiOutput};
 use p9_storage::project::ProjectEnvelope;
+use runtime::{RuntimeCommand, RuntimeCoordinator};
 
 fn main() {
     let mut engine = Engine::new("p9_tracker song");
@@ -78,28 +78,25 @@ fn main() {
         chain_id: Some(0),
     });
 
-    let mut midi_input = NoopMidiInput;
-    let mut midi_output = NoopMidiOutput::default();
-    let mut scheduler = Scheduler::new(24);
-
-    for message in midi_input.poll() {
-        match decode_message(message) {
-            DecodedMidi::Start | DecodedMidi::Continue => scheduler.start(),
-            DecodedMidi::Stop => scheduler.stop(),
-            _ => {}
-        }
-    }
-
-    let mut events = Vec::new();
-    for _ in 0..24 {
-        events.extend(scheduler.tick(&engine));
-    }
-    let midi_messages = forward_render_events(&events, &mut midi_output);
-
     let mut audio = NoopAudioBackend::default();
     audio.start();
-    audio.push_events(&events);
+
+    let mut runtime = RuntimeCoordinator::new(24);
+    runtime.enqueue_commands([RuntimeCommand::Rewind, RuntimeCommand::Start]);
+
+    let mut midi_input = NoopMidiInput;
+    let mut midi_output = NoopMidiOutput::default();
+    let mut events_total = 0usize;
+    let mut midi_total = 0usize;
+
+    for _ in 0..24 {
+        let _mapped = runtime.ingest_midi_input(&mut midi_input);
+        let report = runtime.run_tick(&engine, &mut audio, &mut midi_output);
+        events_total = events_total.saturating_add(report.events_emitted);
+        midi_total = midi_total.saturating_add(report.midi_messages_sent);
+    }
     audio.stop();
+    let transport = runtime.snapshot();
 
     let envelope = ProjectEnvelope::new(engine.snapshot().clone());
     let _ = envelope.validate_format();
@@ -107,13 +104,15 @@ fn main() {
     let restored = ProjectEnvelope::from_text(&serialized).expect("storage round-trip");
 
     println!(
-        "p9_tracker stage7 midi: tempo={}, restored_tempo={}, ticks={}, events={}, audio_events={}, midi_events={}",
+        "p9_tracker stage8 runtime: tempo={}, restored_tempo={}, ticks={}, playing={}, events={}, audio_events={}, midi_events={}, processed_commands={}",
         envelope.project.song.tempo,
         restored.project.song.tempo,
-        scheduler.current_tick,
-        events.len(),
+        transport.tick,
+        transport.is_playing,
+        events_total,
         audio.events_consumed(),
-        midi_messages
+        midi_total,
+        transport.processed_commands
     );
 }
 
