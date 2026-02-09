@@ -1,7 +1,8 @@
 use crate::runtime::{RuntimeCommand, RuntimeCoordinator};
 use p9_core::engine::{Engine, EngineCommand, EngineError};
 use p9_core::model::{
-    Chain, Instrument, InstrumentId, InstrumentType, Phrase, Scale, TRACK_COUNT,
+    Chain, Instrument, InstrumentId, InstrumentType, Phrase, Scale, CHAIN_ROW_COUNT,
+    SONG_ROW_COUNT, TRACK_COUNT,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -66,10 +67,13 @@ pub enum UiAction {
     PrevScreen,
     FocusTrackLeft,
     FocusTrackRight,
+    SelectSongRow(usize),
+    SelectChainRow(usize),
     SelectPhrase(u8),
     SelectStep(usize),
     ToggleScaleHighlight,
     TogglePlayStop,
+    RewindTransport,
     EnsureInstrument {
         instrument_id: InstrumentId,
         instrument_type: InstrumentType,
@@ -106,6 +110,8 @@ pub enum UiAction {
 pub enum UiError {
     Engine(EngineError),
     InvalidTrack(usize),
+    InvalidSongRow(usize),
+    InvalidChainRow(usize),
     InvalidStep(usize),
 }
 
@@ -153,6 +159,20 @@ impl UiController {
                 self.focused_track = (self.focused_track + 1) % TRACK_COUNT;
                 Ok(())
             }
+            UiAction::SelectSongRow(row) => {
+                if row >= SONG_ROW_COUNT {
+                    return Err(UiError::InvalidSongRow(row));
+                }
+                self.selected_song_row = row;
+                Ok(())
+            }
+            UiAction::SelectChainRow(row) => {
+                if row >= CHAIN_ROW_COUNT {
+                    return Err(UiError::InvalidChainRow(row));
+                }
+                self.selected_chain_row = row;
+                Ok(())
+            }
             UiAction::SelectPhrase(phrase_id) => {
                 self.selected_phrase_id = phrase_id;
                 Ok(())
@@ -175,6 +195,10 @@ impl UiController {
                 } else {
                     RuntimeCommand::Start
                 });
+                Ok(())
+            }
+            UiAction::RewindTransport => {
+                runtime.enqueue_commands([RuntimeCommand::Stop, RuntimeCommand::Rewind]);
                 Ok(())
             }
             UiAction::EnsureInstrument {
@@ -440,6 +464,35 @@ mod tests {
             .unwrap();
         runtime.run_tick(&engine, &mut audio, &mut midi);
         assert!(runtime.snapshot().is_playing);
+    }
+
+    #[test]
+    fn row_selection_actions_update_cursor() {
+        let mut ui = UiController::default();
+        let mut engine = Engine::new("cursor");
+        let mut runtime = RuntimeCoordinator::new(24);
+
+        ui.handle_action(UiAction::SelectSongRow(3), &mut engine, &mut runtime)
+            .unwrap();
+        ui.handle_action(UiAction::SelectChainRow(2), &mut engine, &mut runtime)
+            .unwrap();
+
+        let snapshot = ui.snapshot(&engine, &runtime);
+        assert_eq!(snapshot.selected_song_row, 3);
+        assert_eq!(snapshot.selected_chain_row, 2);
+    }
+
+    #[test]
+    fn rewind_transport_action_queues_stop_and_rewind() {
+        let mut ui = UiController::default();
+        let mut engine = Engine::new("rewind");
+        let mut runtime = RuntimeCoordinator::new(24);
+
+        ui.handle_action(UiAction::RewindTransport, &mut engine, &mut runtime)
+            .unwrap();
+
+        let snapshot = runtime.snapshot();
+        assert_eq!(snapshot.queued_commands, 2);
     }
 
     #[test]

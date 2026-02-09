@@ -4,6 +4,12 @@ use crate::runtime::RuntimeCoordinator;
 use crate::ui::{ScaleHighlightState, UiAction, UiController, UiError, UiScreen, UiSnapshot};
 use p9_core::engine::Engine;
 use p9_core::model::ProjectData;
+use p9_rt::audio::{AudioBackend, NoopAudioBackend};
+use p9_rt::midi::NoopMidiOutput;
+
+const SONG_VIEW_ROWS: usize = 8;
+const CHAIN_VIEW_ROWS: usize = 8;
+const PHRASE_COLS: usize = 4;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ShellCommandResult {
@@ -16,7 +22,10 @@ pub fn run_interactive_shell(
     engine: &mut Engine,
     runtime: &mut RuntimeCoordinator,
 ) -> io::Result<()> {
-    let mut status = String::from("Shell ready. Commands: n/p/h/l/q");
+    let mut status = String::from("Shell ready. Commands: n/p/h/l/j/k/t/r/q");
+    let mut audio = NoopAudioBackend::default();
+    audio.start();
+    let mut midi_output = NoopMidiOutput::default();
 
     loop {
         let snapshot = ui.snapshot(engine, runtime);
@@ -33,7 +42,15 @@ pub fn run_interactive_shell(
 
         match apply_shell_command(line.trim(), ui, engine, runtime) {
             Ok(ShellCommandResult::Continue(next_status)) => {
-                status = next_status;
+                status = match runtime.run_tick_safe(engine, &mut audio, &mut midi_output) {
+                    Ok(report) => format!(
+                        "{} | transport={} tick={}",
+                        next_status,
+                        transport_label(report.is_playing),
+                        report.tick
+                    ),
+                    Err(_) => format!("{} | runtime fault", next_status),
+                };
             }
             Ok(ShellCommandResult::Exit) => {
                 break;
@@ -70,10 +87,30 @@ pub fn apply_shell_command(
             ui.handle_action(UiAction::FocusTrackRight, engine, runtime)?;
             Ok(ShellCommandResult::Continue(String::from("focus -> right track")))
         }
+        "j" => {
+            let action = cursor_shift_down(ui.snapshot(engine, runtime));
+            ui.handle_action(action, engine, runtime)?;
+            Ok(ShellCommandResult::Continue(String::from("cursor -> down")))
+        }
+        "k" => {
+            let action = cursor_shift_up(ui.snapshot(engine, runtime));
+            ui.handle_action(action, engine, runtime)?;
+            Ok(ShellCommandResult::Continue(String::from("cursor -> up")))
+        }
+        "t" => {
+            ui.handle_action(UiAction::TogglePlayStop, engine, runtime)?;
+            Ok(ShellCommandResult::Continue(String::from("transport -> toggle")))
+        }
+        "r" => {
+            ui.handle_action(UiAction::RewindTransport, engine, runtime)?;
+            Ok(ShellCommandResult::Continue(String::from(
+                "transport -> stop+rewind",
+            )))
+        }
         "q" => Ok(ShellCommandResult::Exit),
         "" => Ok(ShellCommandResult::Continue(String::from("idle"))),
         _ => Ok(ShellCommandResult::Continue(String::from(
-            "unknown command; use n/p/h/l/q",
+            "unknown command; use n/p/h/l/j/k/t/r/q",
         ))),
     }
 }
@@ -81,7 +118,7 @@ pub fn apply_shell_command(
 pub fn render_frame(project: &ProjectData, snapshot: UiSnapshot, status: &str) -> String {
     let mut out = String::new();
 
-    out.push_str("P9 Tracker UI Shell (Phase 15.1)\n");
+    out.push_str("P9 Tracker UI Shell (Phase 15.2)\n");
     out.push_str("Screen Tabs: ");
     out.push_str(&tab(UiScreen::Song, snapshot.screen));
     out.push(' ');
@@ -118,7 +155,9 @@ pub fn render_frame(project: &ProjectData, snapshot: UiSnapshot, status: &str) -
 
     out.push_str("----------------------------------------------------------------\n");
     out.push_str(&format!("Status: {status}\n"));
-    out.push_str("Commands: n=next screen, p=prev screen, h=focus left, l=focus right, q=quit\n");
+    out.push_str(
+        "Commands: n/p screen, h/l focus track, j/k cursor, t toggle play, r rewind, q quit\n",
+    );
 
     out
 }
@@ -146,11 +185,45 @@ fn transport_label(playing: bool) -> &'static str {
     }
 }
 
+fn wrap_next(current: usize, len: usize) -> usize {
+    (current + 1) % len
+}
+
+fn wrap_prev(current: usize, len: usize) -> usize {
+    if current == 0 {
+        len - 1
+    } else {
+        current - 1
+    }
+}
+
+fn cursor_shift_down(snapshot: UiSnapshot) -> UiAction {
+    match snapshot.screen {
+        UiScreen::Song => UiAction::SelectSongRow(wrap_next(snapshot.selected_song_row, SONG_VIEW_ROWS)),
+        UiScreen::Chain => {
+            UiAction::SelectChainRow(wrap_next(snapshot.selected_chain_row, CHAIN_VIEW_ROWS))
+        }
+        UiScreen::Phrase => UiAction::SelectStep((snapshot.selected_step + PHRASE_COLS) % 16),
+        UiScreen::Mixer => UiAction::FocusTrackRight,
+    }
+}
+
+fn cursor_shift_up(snapshot: UiSnapshot) -> UiAction {
+    match snapshot.screen {
+        UiScreen::Song => UiAction::SelectSongRow(wrap_prev(snapshot.selected_song_row, SONG_VIEW_ROWS)),
+        UiScreen::Chain => {
+            UiAction::SelectChainRow(wrap_prev(snapshot.selected_chain_row, CHAIN_VIEW_ROWS))
+        }
+        UiScreen::Phrase => UiAction::SelectStep((snapshot.selected_step + 16 - PHRASE_COLS) % 16),
+        UiScreen::Mixer => UiAction::FocusTrackLeft,
+    }
+}
+
 fn render_song_panel(out: &mut String, project: &ProjectData, snapshot: UiSnapshot) {
     out.push_str("Song Panel\n");
 
     if let Some(track) = project.song.tracks.get(snapshot.focused_track) {
-        for row in 0..8usize {
+        for row in 0..SONG_VIEW_ROWS {
             let marker = if row == snapshot.selected_song_row {
                 ">"
             } else {
@@ -193,7 +266,7 @@ fn render_chain_panel(out: &mut String, project: &ProjectData, snapshot: UiSnaps
 
     out.push_str(&format!("Chain ID: {chain_id}\n"));
 
-    for row in 0..8usize {
+    for row in 0..CHAIN_VIEW_ROWS {
         let marker = if row == snapshot.selected_chain_row {
             ">"
         } else {
@@ -294,10 +367,10 @@ mod tests {
         let snapshot = ui.snapshot(&engine, &runtime);
         let frame = render_frame(engine.snapshot(), snapshot, "ok");
 
-        assert!(frame.contains("P9 Tracker UI Shell (Phase 15.1)"));
+        assert!(frame.contains("P9 Tracker UI Shell (Phase 15.2)"));
         assert!(frame.contains("Screen Tabs:"));
         assert!(frame.contains("Song Panel"));
-        assert!(frame.contains("Commands: n=next screen"));
+        assert!(frame.contains("Commands: n/p screen"));
 
         let _ = apply_shell_command("n", &mut ui, &mut engine, &mut runtime).unwrap();
         let chain_frame = render_frame(engine.snapshot(), ui.snapshot(&engine, &runtime), "ok");
@@ -320,6 +393,40 @@ mod tests {
             ShellCommandResult::Continue(String::from("focus -> right track"))
         );
         assert_eq!(ui.snapshot(&engine, &runtime).focused_track, 1);
+    }
+
+    #[test]
+    fn shell_cursor_commands_move_rows_and_steps() {
+        let mut ui = UiController::default();
+        let mut engine = Engine::new("shell");
+        let mut runtime = RuntimeCoordinator::new(24);
+
+        let _ = apply_shell_command("j", &mut ui, &mut engine, &mut runtime).unwrap();
+        assert_eq!(ui.snapshot(&engine, &runtime).selected_song_row, 1);
+
+        let _ = apply_shell_command("n", &mut ui, &mut engine, &mut runtime).unwrap();
+        let _ = apply_shell_command("j", &mut ui, &mut engine, &mut runtime).unwrap();
+        assert_eq!(ui.snapshot(&engine, &runtime).selected_chain_row, 1);
+
+        let _ = apply_shell_command("n", &mut ui, &mut engine, &mut runtime).unwrap();
+        let _ = apply_shell_command("j", &mut ui, &mut engine, &mut runtime).unwrap();
+        assert_eq!(ui.snapshot(&engine, &runtime).selected_step, 4);
+
+        let _ = apply_shell_command("k", &mut ui, &mut engine, &mut runtime).unwrap();
+        assert_eq!(ui.snapshot(&engine, &runtime).selected_step, 0);
+    }
+
+    #[test]
+    fn shell_transport_commands_queue_runtime_updates() {
+        let mut ui = UiController::default();
+        let mut engine = Engine::new("shell");
+        let mut runtime = RuntimeCoordinator::new(24);
+
+        let _ = apply_shell_command("t", &mut ui, &mut engine, &mut runtime).unwrap();
+        assert_eq!(runtime.snapshot().queued_commands, 1);
+
+        let _ = apply_shell_command("r", &mut ui, &mut engine, &mut runtime).unwrap();
+        assert_eq!(runtime.snapshot().queued_commands, 3);
     }
 
     #[test]
