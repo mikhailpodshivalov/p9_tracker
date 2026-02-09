@@ -2,7 +2,7 @@
 
 ## Status
 
-- Current stage: `Phase 3 tracker-core iteration completed`
+- Current stage: `Phase 4 timing and scale core completed`
 - Main implementation stack: `Rust`
 
 ## Phase 1 Artifacts
@@ -21,3 +21,7 @@
 ## Phase 3 Artifacts
 
 - `docs/phase3_tracker_core.md`
+
+## Phase 4 Artifacts
+
+- `docs/phase4_timing_and_scale.md`

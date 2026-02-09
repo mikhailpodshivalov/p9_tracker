@@ -1,5 +1,5 @@
 use p9_core::engine::{Engine, EngineCommand};
-use p9_core::model::{Chain, Instrument, InstrumentType, Phrase};
+use p9_core::model::{Chain, Groove, Instrument, InstrumentType, Phrase, Scale};
 use p9_core::scheduler::Scheduler;
 use p9_rt::audio::{AudioBackend, NoopAudioBackend};
 use p9_storage::project::ProjectEnvelope;
@@ -17,6 +17,21 @@ fn main() {
     let instrument = Instrument::new(0, InstrumentType::Synth, "Init Synth");
     let _ = engine.apply_command(EngineCommand::UpsertInstrument { instrument });
 
+    let groove = Groove {
+        id: 1,
+        ticks_pattern: vec![6, 6, 3, 9],
+    };
+    let _ = engine.apply_command(EngineCommand::UpsertGroove { groove });
+    let _ = engine.apply_command(EngineCommand::SetDefaultGroove(1));
+
+    let scale = Scale {
+        id: 1,
+        key: 0,
+        interval_mask: major_scale_mask(),
+    };
+    let _ = engine.apply_command(EngineCommand::UpsertScale { scale });
+    let _ = engine.apply_command(EngineCommand::SetDefaultScale(1));
+
     let _ = engine.apply_command(EngineCommand::SetChainRowPhrase {
         chain_id: 0,
         row: 0,
@@ -27,7 +42,7 @@ fn main() {
     let _ = engine.apply_command(EngineCommand::SetPhraseStep {
         phrase_id: 0,
         step_index: 0,
-        note: Some(60),
+        note: Some(61), // intentionally out-of-scale to show quantization
         velocity: 100,
         instrument_id: Some(0),
     });
@@ -69,11 +84,20 @@ fn main() {
     let restored = ProjectEnvelope::from_text(&serialized).expect("storage round-trip");
 
     println!(
-        "p9_tracker stage3 core: tempo={}, restored_tempo={}, ticks={}, events={}, audio_events={}",
+        "p9_tracker stage4 core: tempo={}, restored_tempo={}, ticks={}, events={}, audio_events={}",
         envelope.project.song.tempo,
         restored.project.song.tempo,
         scheduler.current_tick,
         events.len(),
         audio.events_consumed()
     );
+}
+
+fn major_scale_mask() -> u16 {
+    let intervals = [0u16, 2, 4, 5, 7, 9, 11];
+    let mut mask = 0u16;
+    for interval in intervals {
+        mask |= 1 << interval;
+    }
+    mask
 }

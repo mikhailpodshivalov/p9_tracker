@@ -1,10 +1,13 @@
 use crate::model::{
-    Chain, ChainId, Instrument, InstrumentId, Phrase, PhraseId, ProjectData,
+    Chain, ChainId, Groove, GrooveId, Instrument, InstrumentId, Phrase, PhraseId, ProjectData,
+    Scale, ScaleId,
 };
 
 #[derive(Clone, Debug)]
 pub enum EngineCommand {
     SetTempo(u16),
+    SetDefaultGroove(GrooveId),
+    SetDefaultScale(ScaleId),
     ToggleTrackMute {
         track_index: usize,
     },
@@ -34,6 +37,12 @@ pub enum EngineCommand {
     },
     UpsertInstrument {
         instrument: Instrument,
+    },
+    UpsertGroove {
+        groove: Groove,
+    },
+    UpsertScale {
+        scale: Scale,
     },
 }
 
@@ -70,6 +79,14 @@ impl Engine {
                     return Err(EngineError::InvalidTempo);
                 }
                 self.project.song.tempo = tempo;
+                Ok(())
+            }
+            EngineCommand::SetDefaultGroove(groove_id) => {
+                self.project.song.default_groove = groove_id;
+                Ok(())
+            }
+            EngineCommand::SetDefaultScale(scale_id) => {
+                self.project.song.default_scale = scale_id;
                 Ok(())
             }
             EngineCommand::ToggleTrackMute { track_index } => {
@@ -153,6 +170,14 @@ impl Engine {
             }
             EngineCommand::UpsertInstrument { instrument } => {
                 self.project.instruments.insert(instrument.id, instrument);
+                Ok(())
+            }
+            EngineCommand::UpsertGroove { groove } => {
+                self.project.grooves.insert(groove.id, groove);
+                Ok(())
+            }
+            EngineCommand::UpsertScale { scale } => {
+                self.project.scales.insert(scale.id, scale);
                 Ok(())
             }
         }

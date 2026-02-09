@@ -1,7 +1,7 @@
 use crate::engine::Engine;
 use crate::events::RenderEvent;
 use crate::model::{
-    ChainId, PHRASE_STEP_COUNT, ProjectData, SONG_ROW_COUNT, TRACK_COUNT,
+    ChainId, ProjectData, Scale, PHRASE_STEP_COUNT, SONG_ROW_COUNT, TRACK_COUNT,
 };
 
 #[derive(Clone, Debug, Default)]
@@ -116,6 +116,7 @@ impl Scheduler {
         let step = phrase.steps.get(state.phrase_step)?;
 
         let note = step.note.map(|raw_note| Self::apply_transpose(raw_note, chain_row.transpose))?;
+        let note = self.apply_scale(project, note);
 
         Some(RenderEvent::NoteOn {
             track_id: track.index,
@@ -130,14 +131,92 @@ impl Scheduler {
         value.clamp(0, 127) as u8
     }
 
+    fn apply_scale(&self, project: &ProjectData, note: u8) -> u8 {
+        let Some(scale) = project.scales.get(&project.song.default_scale) else {
+            return note;
+        };
+
+        Self::quantize_to_scale(note, scale)
+    }
+
+    fn quantize_to_scale(note: u8, scale: &Scale) -> u8 {
+        if scale.interval_mask == 0 {
+            return note;
+        }
+
+        let key = scale.key % 12;
+        let is_allowed = |pitch_class: u8| -> bool {
+            let interval = (12 + pitch_class as i16 - key as i16) % 12;
+            ((scale.interval_mask >> interval) & 1) != 0
+        };
+
+        let base_pc = note % 12;
+        if is_allowed(base_pc) {
+            return note;
+        }
+
+        for distance in 1..=12 {
+            if note >= distance {
+                let down = note - distance;
+                if is_allowed(down % 12) {
+                    return down;
+                }
+            }
+
+            if note + distance <= 127 {
+                let up = note + distance;
+                if is_allowed(up % 12) {
+                    return up;
+                }
+            }
+        }
+
+        note
+    }
+
+    fn ticks_for_current_step(&self, project: &ProjectData, track_index: usize) -> u8 {
+        let state = &self.track_state[track_index];
+        let Some(track) = project.song.tracks.get(track_index) else {
+            return self.ticks_per_step;
+        };
+
+        let Some(chain_id) = track.song_rows.get(state.song_row).and_then(|slot| *slot) else {
+            return self.ticks_per_step;
+        };
+
+        let Some(chain) = project.chains.get(&chain_id) else {
+            return self.ticks_per_step;
+        };
+
+        if chain.rows.get(state.chain_row).is_none() {
+            return self.ticks_per_step;
+        }
+
+        let Some(groove) = project.grooves.get(&project.song.default_groove) else {
+            return self.ticks_per_step;
+        };
+
+        if groove.ticks_pattern.is_empty() {
+            return self.ticks_per_step;
+        }
+
+        let pattern_index = state.phrase_step % groove.ticks_pattern.len();
+        let value = groove.ticks_pattern[pattern_index];
+        if value == 0 {
+            1
+        } else {
+            value
+        }
+    }
+
     fn advance_one_tick(&mut self, project: &ProjectData, track_index: usize) {
-        let ticks_per_step = self.ticks_per_step;
+        let ticks_needed = self.ticks_for_current_step(project, track_index).max(1);
         let mut song_row = self.track_state[track_index].song_row;
         let mut chain_row = self.track_state[track_index].chain_row;
         let mut phrase_step = self.track_state[track_index].phrase_step;
         let mut tick_in_step = self.track_state[track_index].tick_in_step.saturating_add(1);
 
-        if tick_in_step >= ticks_per_step {
+        if tick_in_step >= ticks_needed {
             tick_in_step = 0;
             phrase_step += 1;
 
@@ -225,7 +304,8 @@ impl Scheduler {
 mod tests {
     use super::Scheduler;
     use crate::engine::{Engine, EngineCommand};
-    use crate::model::{Chain, Phrase};
+    use crate::events::RenderEvent;
+    use crate::model::{Chain, Groove, Phrase, Scale};
 
     fn setup_engine() -> Engine {
         let mut engine = Engine::new("test");
@@ -279,5 +359,76 @@ mod tests {
         let events = scheduler.tick(&engine);
 
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn groove_changes_step_timing() {
+        let mut engine = setup_engine();
+
+        let groove = Groove {
+            id: 1,
+            ticks_pattern: vec![1, 2, 1, 1],
+        };
+        engine
+            .apply_command(EngineCommand::UpsertGroove { groove })
+            .unwrap();
+        engine
+            .apply_command(EngineCommand::SetDefaultGroove(1))
+            .unwrap();
+
+        let mut scheduler = Scheduler::new(4);
+        let t1 = scheduler.tick(&engine);
+        let t2 = scheduler.tick(&engine);
+        let t3 = scheduler.tick(&engine);
+        let t4 = scheduler.tick(&engine);
+
+        assert_eq!(t1.len(), 1);
+        assert_eq!(t2.len(), 0);
+        assert_eq!(t3.len(), 0);
+        assert_eq!(t4.len(), 1);
+    }
+
+    #[test]
+    fn scale_quantizes_out_of_scale_note() {
+        let mut engine = setup_engine();
+
+        let scale = Scale {
+            id: 2,
+            key: 0,
+            interval_mask: major_scale_mask(),
+        };
+        engine
+            .apply_command(EngineCommand::UpsertScale { scale })
+            .unwrap();
+        engine
+            .apply_command(EngineCommand::SetDefaultScale(2))
+            .unwrap();
+
+        engine
+            .apply_command(EngineCommand::SetPhraseStep {
+                phrase_id: 0,
+                step_index: 0,
+                note: Some(61), // C#
+                velocity: 100,
+                instrument_id: Some(0),
+            })
+            .unwrap();
+
+        let mut scheduler = Scheduler::new(4);
+        let events = scheduler.tick(&engine);
+
+        match &events[0] {
+            RenderEvent::NoteOn { note, .. } => assert_eq!(*note, 60),
+            _ => panic!("expected note on"),
+        }
+    }
+
+    fn major_scale_mask() -> u16 {
+        let intervals = [0u16, 2, 4, 5, 7, 9, 11];
+        let mut mask = 0u16;
+        for i in intervals {
+            mask |= 1 << i;
+        }
+        mask
     }
 }
