@@ -22,7 +22,7 @@ pub fn run_interactive_shell(
     engine: &mut Engine,
     runtime: &mut RuntimeCoordinator,
 ) -> io::Result<()> {
-    let mut status = String::from("Shell ready. Commands: n/p/h/l/j/k/t/r/q");
+    let mut status = String::from("Shell ready. Commands: n/p/h/l/j/k/t/r/c/f/i/e/+/-/q");
     let mut audio = NoopAudioBackend::default();
     audio.start();
     let mut midi_output = NoopMidiOutput::default();
@@ -107,10 +107,122 @@ pub fn apply_shell_command(
                 "transport -> stop+rewind",
             )))
         }
+        "c" => {
+            let snapshot = ui.snapshot(engine, runtime);
+            let chain_id = snapshot.selected_song_row as u8;
+            ui.handle_action(UiAction::EnsureChain { chain_id }, engine, runtime)?;
+            ui.handle_action(
+                UiAction::BindTrackRowToChain {
+                    song_row: snapshot.selected_song_row,
+                    chain_id: Some(chain_id),
+                },
+                engine,
+                runtime,
+            )?;
+            Ok(ShellCommandResult::Continue(format!(
+                "edit -> bind song row {} to chain {}",
+                snapshot.selected_song_row, chain_id
+            )))
+        }
+        "f" => {
+            let snapshot = ui.snapshot(engine, runtime);
+            let chain_id = engine
+                .snapshot()
+                .song
+                .tracks
+                .get(snapshot.focused_track)
+                .and_then(|track| track.song_rows.get(snapshot.selected_song_row))
+                .copied()
+                .flatten()
+                .unwrap_or(snapshot.selected_song_row as u8);
+            let phrase_id = (snapshot.selected_song_row * CHAIN_VIEW_ROWS
+                + snapshot.selected_chain_row) as u8;
+
+            ui.handle_action(UiAction::EnsureChain { chain_id }, engine, runtime)?;
+            ui.handle_action(UiAction::EnsurePhrase { phrase_id }, engine, runtime)?;
+            ui.handle_action(UiAction::SelectPhrase(phrase_id), engine, runtime)?;
+            ui.handle_action(
+                UiAction::BindChainRowToPhrase {
+                    chain_id,
+                    chain_row: snapshot.selected_chain_row,
+                    phrase_id: Some(phrase_id),
+                    transpose: 0,
+                },
+                engine,
+                runtime,
+            )?;
+            Ok(ShellCommandResult::Continue(format!(
+                "edit -> bind chain {} row {} to phrase {}",
+                chain_id, snapshot.selected_chain_row, phrase_id
+            )))
+        }
+        "i" => {
+            let snapshot = ui.snapshot(engine, runtime);
+            let instrument_id = snapshot.focused_track as u8;
+            ui.handle_action(
+                UiAction::EnsureInstrument {
+                    instrument_id,
+                    instrument_type: p9_core::model::InstrumentType::Synth,
+                    name: format!("Track {} Synth", snapshot.focused_track),
+                },
+                engine,
+                runtime,
+            )?;
+            Ok(ShellCommandResult::Continue(format!(
+                "edit -> ensure instrument {}",
+                instrument_id
+            )))
+        }
+        "e" => {
+            let snapshot = ui.snapshot(engine, runtime);
+            let instrument_id = snapshot.focused_track as u8;
+            let note = seeded_note(snapshot.selected_step);
+
+            ui.handle_action(
+                UiAction::EnsurePhrase {
+                    phrase_id: snapshot.selected_phrase_id,
+                },
+                engine,
+                runtime,
+            )?;
+            ui.handle_action(
+                UiAction::EditStep {
+                    phrase_id: snapshot.selected_phrase_id,
+                    step_index: snapshot.selected_step,
+                    note: Some(note),
+                    velocity: 100,
+                    instrument_id: Some(instrument_id),
+                },
+                engine,
+                runtime,
+            )?;
+            Ok(ShellCommandResult::Continue(format!(
+                "edit -> step {} note {} ins {}",
+                snapshot.selected_step, note, instrument_id
+            )))
+        }
+        "+" => {
+            let snapshot = ui.snapshot(engine, runtime);
+            let next_level = snapshot.focused_track_level.saturating_add(4);
+            ui.handle_action(UiAction::SetTrackLevel(next_level), engine, runtime)?;
+            Ok(ShellCommandResult::Continue(format!(
+                "mixer -> track {} level {}",
+                snapshot.focused_track, next_level
+            )))
+        }
+        "-" => {
+            let snapshot = ui.snapshot(engine, runtime);
+            let next_level = snapshot.focused_track_level.saturating_sub(4);
+            ui.handle_action(UiAction::SetTrackLevel(next_level), engine, runtime)?;
+            Ok(ShellCommandResult::Continue(format!(
+                "mixer -> track {} level {}",
+                snapshot.focused_track, next_level
+            )))
+        }
         "q" => Ok(ShellCommandResult::Exit),
         "" => Ok(ShellCommandResult::Continue(String::from("idle"))),
         _ => Ok(ShellCommandResult::Continue(String::from(
-            "unknown command; use n/p/h/l/j/k/t/r/q",
+            "unknown command; use n/p/h/l/j/k/t/r/c/f/i/e/+/-/q",
         ))),
     }
 }
@@ -118,7 +230,7 @@ pub fn apply_shell_command(
 pub fn render_frame(project: &ProjectData, snapshot: UiSnapshot, status: &str) -> String {
     let mut out = String::new();
 
-    out.push_str("P9 Tracker UI Shell (Phase 15.2)\n");
+    out.push_str("P9 Tracker UI Shell (Phase 15.3)\n");
     out.push_str("Screen Tabs: ");
     out.push_str(&tab(UiScreen::Song, snapshot.screen));
     out.push(' ');
@@ -156,7 +268,7 @@ pub fn render_frame(project: &ProjectData, snapshot: UiSnapshot, status: &str) -
     out.push_str("----------------------------------------------------------------\n");
     out.push_str(&format!("Status: {status}\n"));
     out.push_str(
-        "Commands: n/p screen, h/l focus track, j/k cursor, t toggle play, r rewind, q quit\n",
+        "Commands: n/p screen, h/l track, j/k cursor, t play, r rewind, c/f/i/e edit, +/- level, q quit\n",
     );
 
     out
@@ -183,6 +295,13 @@ fn transport_label(playing: bool) -> &'static str {
     } else {
         "STOP"
     }
+}
+
+fn seeded_note(step_index: usize) -> u8 {
+    const MAJOR: [u8; 7] = [0, 2, 4, 5, 7, 9, 11];
+    let octave = (step_index / MAJOR.len()) as u8;
+    let interval = MAJOR[step_index % MAJOR.len()];
+    60u8.saturating_add(interval).saturating_add(octave.saturating_mul(12))
 }
 
 fn wrap_next(current: usize, len: usize) -> usize {
@@ -367,7 +486,7 @@ mod tests {
         let snapshot = ui.snapshot(&engine, &runtime);
         let frame = render_frame(engine.snapshot(), snapshot, "ok");
 
-        assert!(frame.contains("P9 Tracker UI Shell (Phase 15.2)"));
+        assert!(frame.contains("P9 Tracker UI Shell (Phase 15.3)"));
         assert!(frame.contains("Screen Tabs:"));
         assert!(frame.contains("Song Panel"));
         assert!(frame.contains("Commands: n/p screen"));
@@ -427,6 +546,43 @@ mod tests {
 
         let _ = apply_shell_command("r", &mut ui, &mut engine, &mut runtime).unwrap();
         assert_eq!(runtime.snapshot().queued_commands, 3);
+    }
+
+    #[test]
+    fn shell_edit_commands_create_minimal_authoring_flow() {
+        let mut ui = UiController::default();
+        let mut engine = Engine::new("shell");
+        let mut runtime = RuntimeCoordinator::new(24);
+
+        let _ = apply_shell_command("c", &mut ui, &mut engine, &mut runtime).unwrap();
+        let _ = apply_shell_command("f", &mut ui, &mut engine, &mut runtime).unwrap();
+        let _ = apply_shell_command("i", &mut ui, &mut engine, &mut runtime).unwrap();
+        let _ = apply_shell_command("e", &mut ui, &mut engine, &mut runtime).unwrap();
+
+        let project = engine.snapshot();
+        assert_eq!(project.song.tracks[0].song_rows[0], Some(0));
+        assert_eq!(project.chains.get(&0).unwrap().rows[0].phrase_id, Some(0));
+
+        let phrase = project.phrases.get(&0).unwrap();
+        assert_eq!(phrase.steps[0].note, Some(60));
+        assert_eq!(phrase.steps[0].velocity, 100);
+        assert_eq!(phrase.steps[0].instrument_id, Some(0));
+        assert!(project.instruments.contains_key(&0));
+    }
+
+    #[test]
+    fn shell_mixer_commands_change_track_level() {
+        let mut ui = UiController::default();
+        let mut engine = Engine::new("shell");
+        let mut runtime = RuntimeCoordinator::new(24);
+
+        assert_eq!(ui.snapshot(&engine, &runtime).focused_track_level, 128);
+
+        let _ = apply_shell_command("+", &mut ui, &mut engine, &mut runtime).unwrap();
+        assert_eq!(ui.snapshot(&engine, &runtime).focused_track_level, 132);
+
+        let _ = apply_shell_command("-", &mut ui, &mut engine, &mut runtime).unwrap();
+        assert_eq!(ui.snapshot(&engine, &runtime).focused_track_level, 128);
     }
 
     #[test]

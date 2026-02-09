@@ -2,7 +2,7 @@
 
 ## Status
 
-- Current stage: `Phase 15.2 navigation + transport completed`
+- Current stage: `Phase 15.3 minimal edit loop completed`
 - Main implementation stack: `Rust`
 
 ## Phase 1 Artifacts
@@ -73,6 +73,10 @@
 ## Phase 15.2 Artifacts
 
 - `docs/phase15_2_navigation_transport.md`
+
+## Phase 15.3 Artifacts
+
+- `docs/phase15_3_minimal_edit_loop.md`
 
 ## Forward Plan
 
