@@ -2,7 +2,7 @@
 
 ## Status
 
-- Current stage: `Phase 15.3 minimal edit loop completed`
+- Current stage: `Phase 15.4 UX safety + smoke completed`
 - Main implementation stack: `Rust`
 
 ## Phase 1 Artifacts
@@ -77,6 +77,10 @@
 ## Phase 15.3 Artifacts
 
 - `docs/phase15_3_minimal_edit_loop.md`
+
+## Phase 15.4 Artifacts
+
+- `docs/phase15_4_ux_safety_smoke.md`
 
 ## Forward Plan
 

@@ -22,7 +22,7 @@ pub fn run_interactive_shell(
     engine: &mut Engine,
     runtime: &mut RuntimeCoordinator,
 ) -> io::Result<()> {
-    let mut status = String::from("Shell ready. Commands: n/p/h/l/j/k/t/r/c/f/i/e/+/-/q");
+    let mut status = String::from("Shell ready. Commands: n/p/h/l/j/k/t/r/c/f/i/e/+/-/?/q");
     let mut audio = NoopAudioBackend::default();
     audio.start();
     let mut midi_output = NoopMidiOutput::default();
@@ -126,19 +126,14 @@ pub fn apply_shell_command(
         }
         "f" => {
             let snapshot = ui.snapshot(engine, runtime);
-            let chain_id = engine
-                .snapshot()
-                .song
-                .tracks
-                .get(snapshot.focused_track)
-                .and_then(|track| track.song_rows.get(snapshot.selected_song_row))
-                .copied()
-                .flatten()
-                .unwrap_or(snapshot.selected_song_row as u8);
+            let Some(chain_id) = bound_chain_id(engine.snapshot(), snapshot) else {
+                return Ok(ShellCommandResult::Continue(String::from(
+                    "warn: no chain on selected song row; run c first",
+                )));
+            };
             let phrase_id = (snapshot.selected_song_row * CHAIN_VIEW_ROWS
                 + snapshot.selected_chain_row) as u8;
 
-            ui.handle_action(UiAction::EnsureChain { chain_id }, engine, runtime)?;
             ui.handle_action(UiAction::EnsurePhrase { phrase_id }, engine, runtime)?;
             ui.handle_action(UiAction::SelectPhrase(phrase_id), engine, runtime)?;
             ui.handle_action(
@@ -176,18 +171,29 @@ pub fn apply_shell_command(
         "e" => {
             let snapshot = ui.snapshot(engine, runtime);
             let instrument_id = snapshot.focused_track as u8;
+            if !engine.snapshot().instruments.contains_key(&instrument_id) {
+                return Ok(ShellCommandResult::Continue(format!(
+                    "warn: instrument {} missing; run i first",
+                    instrument_id
+                )));
+            }
+
+            let Some(chain_id) = bound_chain_id(engine.snapshot(), snapshot) else {
+                return Ok(ShellCommandResult::Continue(String::from(
+                    "warn: no chain on selected song row; run c first",
+                )));
+            };
+            let Some(phrase_id) = bound_phrase_id(engine.snapshot(), chain_id, snapshot) else {
+                return Ok(ShellCommandResult::Continue(String::from(
+                    "warn: no phrase on selected chain row; run f first",
+                )));
+            };
             let note = seeded_note(snapshot.selected_step);
 
-            ui.handle_action(
-                UiAction::EnsurePhrase {
-                    phrase_id: snapshot.selected_phrase_id,
-                },
-                engine,
-                runtime,
-            )?;
+            ui.handle_action(UiAction::SelectPhrase(phrase_id), engine, runtime)?;
             ui.handle_action(
                 UiAction::EditStep {
-                    phrase_id: snapshot.selected_phrase_id,
+                    phrase_id,
                     step_index: snapshot.selected_step,
                     note: Some(note),
                     velocity: 100,
@@ -197,13 +203,18 @@ pub fn apply_shell_command(
                 runtime,
             )?;
             Ok(ShellCommandResult::Continue(format!(
-                "edit -> step {} note {} ins {}",
-                snapshot.selected_step, note, instrument_id
+                "edit -> phrase {} step {} note {} ins {}",
+                phrase_id, snapshot.selected_step, note, instrument_id
             )))
         }
         "+" => {
             let snapshot = ui.snapshot(engine, runtime);
             let next_level = snapshot.focused_track_level.saturating_add(4);
+            if next_level == snapshot.focused_track_level {
+                return Ok(ShellCommandResult::Continue(String::from(
+                    "warn: track level already at max",
+                )));
+            }
             ui.handle_action(UiAction::SetTrackLevel(next_level), engine, runtime)?;
             Ok(ShellCommandResult::Continue(format!(
                 "mixer -> track {} level {}",
@@ -213,16 +224,22 @@ pub fn apply_shell_command(
         "-" => {
             let snapshot = ui.snapshot(engine, runtime);
             let next_level = snapshot.focused_track_level.saturating_sub(4);
+            if next_level == snapshot.focused_track_level {
+                return Ok(ShellCommandResult::Continue(String::from(
+                    "warn: track level already at min",
+                )));
+            }
             ui.handle_action(UiAction::SetTrackLevel(next_level), engine, runtime)?;
             Ok(ShellCommandResult::Continue(format!(
                 "mixer -> track {} level {}",
                 snapshot.focused_track, next_level
             )))
         }
+        "?" => Ok(ShellCommandResult::Continue(String::from(command_help()))),
         "q" => Ok(ShellCommandResult::Exit),
         "" => Ok(ShellCommandResult::Continue(String::from("idle"))),
         _ => Ok(ShellCommandResult::Continue(String::from(
-            "unknown command; use n/p/h/l/j/k/t/r/c/f/i/e/+/-/q",
+            "unknown command; use n/p/h/l/j/k/t/r/c/f/i/e/+/-/?/q",
         ))),
     }
 }
@@ -230,7 +247,7 @@ pub fn apply_shell_command(
 pub fn render_frame(project: &ProjectData, snapshot: UiSnapshot, status: &str) -> String {
     let mut out = String::new();
 
-    out.push_str("P9 Tracker UI Shell (Phase 15.3)\n");
+    out.push_str("P9 Tracker UI Shell (Phase 15.4)\n");
     out.push_str("Screen Tabs: ");
     out.push_str(&tab(UiScreen::Song, snapshot.screen));
     out.push(' ');
@@ -268,7 +285,7 @@ pub fn render_frame(project: &ProjectData, snapshot: UiSnapshot, status: &str) -
     out.push_str("----------------------------------------------------------------\n");
     out.push_str(&format!("Status: {status}\n"));
     out.push_str(
-        "Commands: n/p screen, h/l track, j/k cursor, t play, r rewind, c/f/i/e edit, +/- level, q quit\n",
+        "Commands: n/p screen, h/l track, j/k cursor, t play, r rewind, c/f/i/e edit, +/- level, ? help, q quit\n",
     );
 
     out
@@ -302,6 +319,28 @@ fn seeded_note(step_index: usize) -> u8 {
     let octave = (step_index / MAJOR.len()) as u8;
     let interval = MAJOR[step_index % MAJOR.len()];
     60u8.saturating_add(interval).saturating_add(octave.saturating_mul(12))
+}
+
+fn bound_chain_id(project: &ProjectData, snapshot: UiSnapshot) -> Option<u8> {
+    project
+        .song
+        .tracks
+        .get(snapshot.focused_track)
+        .and_then(|track| track.song_rows.get(snapshot.selected_song_row))
+        .copied()
+        .flatten()
+}
+
+fn bound_phrase_id(project: &ProjectData, chain_id: u8, snapshot: UiSnapshot) -> Option<u8> {
+    project
+        .chains
+        .get(&chain_id)
+        .and_then(|chain| chain.rows.get(snapshot.selected_chain_row))
+        .and_then(|row| row.phrase_id)
+}
+
+fn command_help() -> &'static str {
+    "help: n/p screen, h/l track, j/k cursor, t play/stop, r stop+rewind, c bind chain, f bind phrase, i ensure instrument, e edit step, +/- level"
 }
 
 fn wrap_next(current: usize, len: usize) -> usize {
@@ -476,6 +515,8 @@ mod tests {
     use crate::runtime::RuntimeCoordinator;
     use crate::ui::{UiController, UiScreen};
     use p9_core::engine::Engine;
+    use p9_rt::audio::{AudioBackend, NoopAudioBackend};
+    use p9_rt::midi::NoopMidiOutput;
 
     #[test]
     fn render_frame_contains_shell_layout_sections() {
@@ -486,7 +527,7 @@ mod tests {
         let snapshot = ui.snapshot(&engine, &runtime);
         let frame = render_frame(engine.snapshot(), snapshot, "ok");
 
-        assert!(frame.contains("P9 Tracker UI Shell (Phase 15.3)"));
+        assert!(frame.contains("P9 Tracker UI Shell (Phase 15.4)"));
         assert!(frame.contains("Screen Tabs:"));
         assert!(frame.contains("Song Panel"));
         assert!(frame.contains("Commands: n/p screen"));
@@ -593,5 +634,74 @@ mod tests {
 
         let result = apply_shell_command("q", &mut ui, &mut engine, &mut runtime).unwrap();
         assert_eq!(result, ShellCommandResult::Exit);
+    }
+
+    #[test]
+    fn shell_safety_warns_when_phrase_bind_has_no_chain() {
+        let mut ui = UiController::default();
+        let mut engine = Engine::new("shell");
+        let mut runtime = RuntimeCoordinator::new(24);
+
+        let result = apply_shell_command("f", &mut ui, &mut engine, &mut runtime).unwrap();
+        assert_eq!(
+            result,
+            ShellCommandResult::Continue(String::from(
+                "warn: no chain on selected song row; run c first"
+            ))
+        );
+    }
+
+    #[test]
+    fn shell_safety_warns_when_edit_has_no_instrument() {
+        let mut ui = UiController::default();
+        let mut engine = Engine::new("shell");
+        let mut runtime = RuntimeCoordinator::new(24);
+
+        let _ = apply_shell_command("c", &mut ui, &mut engine, &mut runtime).unwrap();
+        let _ = apply_shell_command("f", &mut ui, &mut engine, &mut runtime).unwrap();
+
+        let result = apply_shell_command("e", &mut ui, &mut engine, &mut runtime).unwrap();
+        assert_eq!(
+            result,
+            ShellCommandResult::Continue(String::from(
+                "warn: instrument 0 missing; run i first"
+            ))
+        );
+    }
+
+    #[test]
+    fn shell_help_command_returns_reference() {
+        let mut ui = UiController::default();
+        let mut engine = Engine::new("shell");
+        let mut runtime = RuntimeCoordinator::new(24);
+
+        let result = apply_shell_command("?", &mut ui, &mut engine, &mut runtime).unwrap();
+        assert!(matches!(result, ShellCommandResult::Continue(msg) if msg.contains("help:")));
+    }
+
+    #[test]
+    fn shell_smoke_flow_edit_and_play_emits_events() {
+        let mut ui = UiController::default();
+        let mut engine = Engine::new("shell");
+        let mut runtime = RuntimeCoordinator::new(24);
+
+        let mut audio = NoopAudioBackend::default();
+        audio.start();
+        let mut midi = NoopMidiOutput::default();
+
+        let mut run_step = |command: &str| {
+            let _ = apply_shell_command(command, &mut ui, &mut engine, &mut runtime).unwrap();
+            runtime.run_tick(&engine, &mut audio, &mut midi)
+        };
+
+        let _ = run_step("c");
+        let _ = run_step("f");
+        let _ = run_step("i");
+        let _ = run_step("e");
+        let _ = run_step("r");
+        let report = run_step("t");
+
+        assert_eq!(report.events_emitted, 1);
+        assert!(runtime.snapshot().is_playing);
     }
 }
