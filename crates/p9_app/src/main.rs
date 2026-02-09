@@ -1,14 +1,15 @@
+mod hardening;
 mod runtime;
 mod ui;
 
+use hardening::{AutosaveManager, AutosavePolicy};
 use p9_core::engine::{Engine, EngineCommand};
 use p9_core::model::{FxCommand, Groove, Instrument, InstrumentType, Scale, Table};
-use p9_rt::audio::{
-    build_preferred_audio_backend, start_with_noop_fallback, AudioMetrics,
-};
-use p9_rt::midi::{NoopMidiInput, NoopMidiOutput};
+use p9_rt::audio::{build_preferred_audio_backend, start_with_noop_fallback, AudioMetrics};
+use p9_rt::export::{render_project_to_wav, OfflineRenderConfig};
+use p9_rt::midi::{BufferedMidiInput, BufferedMidiOutput, MidiMessage};
 use p9_storage::project::ProjectEnvelope;
-use runtime::{RuntimeCommand, RuntimeCoordinator};
+use runtime::{RuntimeCommand, RuntimeCoordinator, SyncMode};
 use ui::{UiAction, UiController};
 
 fn main() {
@@ -189,38 +190,66 @@ fn main() {
     let audio_backend_name = started_audio.backend().backend_name();
     let audio_used_fallback = started_audio.used_fallback;
 
-    let mut midi_input = NoopMidiInput;
-    let mut midi_output = NoopMidiOutput::default();
+    let mut midi_input = BufferedMidiInput::default();
+    let mut midi_output = BufferedMidiOutput::default();
     let mut events_total = 0usize;
     let mut midi_total = 0usize;
+    let mut midi_clock_total = 0usize;
     let mut last_audio_metrics = AudioMetrics::default();
     let mut last_voice_steals = 0u64;
 
-    apply_ui(
-        &mut ui,
-        &mut engine,
-        &mut runtime,
-        UiAction::TogglePlayStop,
-    );
-    let _ = runtime.run_tick(&engine, started_audio.backend_mut(), &mut midi_output);
-
+    runtime.set_sync_mode(SyncMode::ExternalClock);
     runtime.enqueue_command(RuntimeCommand::Rewind);
-    apply_ui(
-        &mut ui,
-        &mut engine,
-        &mut runtime,
-        UiAction::TogglePlayStop,
-    );
+    runtime.enqueue_command(RuntimeCommand::Start);
 
-    for _ in 0..24 {
-        let _mapped = runtime.ingest_midi_input(&mut midi_input);
-        let report = runtime.run_tick(
-            &engine,
-            started_audio.backend_mut(),
-            &mut midi_output,
-        );
+    for _ in 0..12 {
+        midi_input.push_message(MidiMessage {
+            status: 0xF8,
+            data1: 0,
+            data2: 0,
+        });
+
+        let report = runtime
+            .run_cycle_safe(
+                &engine,
+                started_audio.backend_mut(),
+                &mut midi_input,
+                &mut midi_output,
+            )
+            .expect("runtime cycle failed");
+
         events_total = events_total.saturating_add(report.events_emitted);
         midi_total = midi_total.saturating_add(report.midi_messages_sent);
+        midi_clock_total = midi_clock_total.saturating_add(report.midi_clock_messages_sent);
+        last_audio_metrics = AudioMetrics {
+            sample_rate_hz: report.audio_sample_rate_hz,
+            buffer_size_frames: report.audio_buffer_size_frames,
+            callbacks_total: report.audio_callbacks_total,
+            xruns_total: report.audio_xruns_total,
+            last_callback_us: report.audio_last_callback_us,
+            avg_callback_us: report.audio_avg_callback_us,
+            active_voices: report.audio_active_voices,
+            max_voices: report.audio_max_voices,
+            voices_stolen_total: report.audio_voices_stolen_total,
+        };
+        last_voice_steals = report.audio_voices_stolen_total;
+    }
+
+    runtime.set_sync_mode(SyncMode::Internal);
+
+    for _ in 0..12 {
+        let report = runtime
+            .run_cycle_safe(
+                &engine,
+                started_audio.backend_mut(),
+                &mut midi_input,
+                &mut midi_output,
+            )
+            .expect("runtime cycle failed");
+
+        events_total = events_total.saturating_add(report.events_emitted);
+        midi_total = midi_total.saturating_add(report.midi_messages_sent);
+        midi_clock_total = midi_clock_total.saturating_add(report.midi_clock_messages_sent);
         last_audio_metrics = AudioMetrics {
             sample_rate_hz: report.audio_sample_rate_hz,
             buffer_size_frames: report.audio_buffer_size_frames,
@@ -251,15 +280,38 @@ fn main() {
     let serialized = envelope.to_text();
     let restored = ProjectEnvelope::from_text(&serialized).expect("storage round-trip");
 
+    let export_path = std::env::temp_dir().join("p9_tracker_phase14_export.wav");
+    let export_report = render_project_to_wav(
+        &engine,
+        &export_path,
+        OfflineRenderConfig {
+            sample_rate_hz: 48_000,
+            ppq: 24,
+            ticks: 96,
+        },
+    )
+    .expect("offline export failed");
+
+    let autosave_path = std::env::temp_dir().join("p9_tracker_phase14_autosave.p9");
+    let mut autosave = AutosaveManager::new(AutosavePolicy { interval_ticks: 16 });
+    let autosave_written = autosave
+        .save_if_due(&engine, transport, true, &autosave_path)
+        .expect("autosave failed");
+
     println!(
-        "p9_tracker stage13 ui-alpha: tempo={}, restored_tempo={}, ticks={}, playing={}, events={}, audio_events={}, midi_events={}, processed_commands={}, backend={}, fallback={}, callbacks={}, xruns={}, last_callback_us={}, avg_callback_us={}, sample_rate={}, buffer_size={}, active_voices={}, max_voices={}, voice_steals={}, ui_screen={:?}, ui_track={}, ui_song_row={}, ui_chain_row={}, ui_phrase={}, ui_step={}, ui_scale_highlight={:?}, ui_track_level={}",
+        "p9_tracker stage14 export-sync-hardening: tempo={}, restored_tempo={}, ticks={}, playing={}, sync_mode={:?}, external_clock_pending={}, events={}, audio_events={}, midi_events={}, midi_clock_events={}, midi_ingested={}, midi_out_messages={}, processed_commands={}, backend={}, fallback={}, callbacks={}, xruns={}, last_callback_us={}, avg_callback_us={}, sample_rate={}, buffer_size={}, active_voices={}, max_voices={}, voice_steals={}, ui_screen={:?}, ui_track={}, ui_song_row={}, ui_chain_row={}, ui_phrase={}, ui_step={}, ui_scale_highlight={:?}, ui_track_level={}, export_ticks={}, export_events={}, export_samples={}, export_peak={}, export_path={}, autosave_written={}, autosave_tick={}, autosave_path={}",
         envelope.project.song.tempo,
         restored.project.song.tempo,
         transport.tick,
         transport.is_playing,
+        transport.sync_mode,
+        transport.external_clock_pending,
         events_total,
         started_audio.backend().events_consumed(),
         midi_total,
+        midi_clock_total,
+        transport.midi_messages_ingested_total,
+        midi_output.sent_count(),
         transport.processed_commands,
         audio_backend_name,
         audio_used_fallback,
@@ -280,6 +332,14 @@ fn main() {
         ui_snapshot.selected_step,
         ui_snapshot.scale_highlight,
         ui_snapshot.focused_track_level,
+        export_report.ticks_rendered,
+        export_report.events_rendered,
+        export_report.samples_rendered,
+        export_report.peak_abs_sample,
+        export_path.display(),
+        autosave_written,
+        autosave.last_saved_tick(),
+        autosave_path.display(),
     );
 }
 

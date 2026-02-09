@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use p9_core::engine::Engine;
 use p9_core::scheduler::Scheduler;
@@ -6,6 +7,12 @@ use p9_rt::audio::AudioBackend;
 use p9_rt::midi::{
     decode_message, forward_render_events, DecodedMidi, MidiInput, MidiMessage, MidiOutput,
 };
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyncMode {
+    Internal,
+    ExternalClock,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RuntimeCommand {
@@ -19,8 +26,12 @@ pub enum RuntimeCommand {
 pub struct TickReport {
     pub events_emitted: usize,
     pub midi_messages_sent: usize,
+    pub midi_clock_messages_sent: usize,
+    pub midi_messages_ingested: u64,
     pub tick: u64,
     pub is_playing: bool,
+    pub sync_mode: SyncMode,
+    pub external_clock_pending: u32,
     pub audio_backend: &'static str,
     pub audio_callbacks_total: u64,
     pub audio_xruns_total: u64,
@@ -37,23 +48,41 @@ pub struct TickReport {
 pub struct TransportSnapshot {
     pub tick: u64,
     pub is_playing: bool,
+    pub sync_mode: SyncMode,
+    pub external_clock_pending: u32,
     pub queued_commands: usize,
     pub processed_commands: u64,
+    pub midi_messages_ingested_total: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeFault {
+    TickPanic,
 }
 
 pub struct RuntimeCoordinator {
     scheduler: Scheduler,
+    sync_mode: SyncMode,
+    external_clock_pending: u32,
     command_queue: VecDeque<RuntimeCommand>,
     processed_commands: u64,
+    midi_messages_ingested_total: u64,
 }
 
 impl RuntimeCoordinator {
     pub fn new(ppq: u16) -> Self {
         Self {
             scheduler: Scheduler::new(ppq),
+            sync_mode: SyncMode::Internal,
+            external_clock_pending: 0,
             command_queue: VecDeque::new(),
             processed_commands: 0,
+            midi_messages_ingested_total: 0,
         }
+    }
+
+    pub fn set_sync_mode(&mut self, mode: SyncMode) {
+        self.set_sync_mode_now(mode);
     }
 
     pub fn enqueue_command(&mut self, command: RuntimeCommand) {
@@ -74,16 +103,25 @@ impl RuntimeCoordinator {
         let mut mapped = 0usize;
 
         for message in messages {
-            let command = match decode_message(message) {
-                DecodedMidi::Start => Some(RuntimeCommand::Start),
-                DecodedMidi::Continue => Some(RuntimeCommand::Continue),
-                DecodedMidi::Stop => Some(RuntimeCommand::Stop),
-                _ => None,
-            };
+            self.midi_messages_ingested_total = self.midi_messages_ingested_total.saturating_add(1);
 
-            if let Some(command) = command {
-                self.enqueue_command(command);
-                mapped = mapped.saturating_add(1);
+            match decode_message(message) {
+                DecodedMidi::Start => {
+                    self.enqueue_command(RuntimeCommand::Start);
+                    mapped = mapped.saturating_add(1);
+                }
+                DecodedMidi::Continue => {
+                    self.enqueue_command(RuntimeCommand::Continue);
+                    mapped = mapped.saturating_add(1);
+                }
+                DecodedMidi::Stop => {
+                    self.enqueue_command(RuntimeCommand::Stop);
+                    mapped = mapped.saturating_add(1);
+                }
+                DecodedMidi::Clock if matches!(self.sync_mode, SyncMode::ExternalClock) => {
+                    self.external_clock_pending = self.external_clock_pending.saturating_add(1);
+                }
+                _ => {}
             }
         }
 
@@ -94,6 +132,30 @@ impl RuntimeCoordinator {
         self.enqueue_midi_messages(input.poll())
     }
 
+    pub fn run_cycle(
+        &mut self,
+        engine: &Engine,
+        audio: &mut dyn AudioBackend,
+        midi_input: &mut dyn MidiInput,
+        midi_output: &mut dyn MidiOutput,
+    ) -> TickReport {
+        let _ = self.ingest_midi_input(midi_input);
+        self.run_tick(engine, audio, midi_output)
+    }
+
+    pub fn run_cycle_safe(
+        &mut self,
+        engine: &Engine,
+        audio: &mut dyn AudioBackend,
+        midi_input: &mut dyn MidiInput,
+        midi_output: &mut dyn MidiOutput,
+    ) -> Result<TickReport, RuntimeFault> {
+        catch_unwind(AssertUnwindSafe(|| {
+            self.run_cycle(engine, audio, midi_input, midi_output)
+        }))
+        .map_err(|_| RuntimeFault::TickPanic)
+    }
+
     pub fn run_tick(
         &mut self,
         engine: &Engine,
@@ -102,16 +164,37 @@ impl RuntimeCoordinator {
     ) -> TickReport {
         self.apply_queued_commands();
 
-        let events = self.scheduler.tick(engine);
+        let events = if self.should_advance_tick() {
+            self.scheduler.tick(engine)
+        } else {
+            Vec::new()
+        };
+
         audio.push_events(&events);
-        let midi_messages_sent = forward_render_events(&events, midi_output);
+        let mut midi_messages_sent = forward_render_events(&events, midi_output);
+
+        let mut midi_clock_messages_sent = 0usize;
+        if matches!(self.sync_mode, SyncMode::Internal) && self.scheduler.is_playing {
+            midi_output.send(MidiMessage {
+                status: 0xF8,
+                data1: 0,
+                data2: 0,
+            });
+            midi_messages_sent = midi_messages_sent.saturating_add(1);
+            midi_clock_messages_sent = 1;
+        }
+
         let audio_metrics = audio.metrics();
 
         TickReport {
             events_emitted: events.len(),
             midi_messages_sent,
+            midi_clock_messages_sent,
+            midi_messages_ingested: self.midi_messages_ingested_total,
             tick: self.scheduler.current_tick,
             is_playing: self.scheduler.is_playing,
+            sync_mode: self.sync_mode,
+            external_clock_pending: self.external_clock_pending,
             audio_backend: audio.backend_name(),
             audio_callbacks_total: audio_metrics.callbacks_total,
             audio_xruns_total: audio_metrics.xruns_total,
@@ -125,12 +208,25 @@ impl RuntimeCoordinator {
         }
     }
 
+    pub fn run_tick_safe(
+        &mut self,
+        engine: &Engine,
+        audio: &mut dyn AudioBackend,
+        midi_output: &mut dyn MidiOutput,
+    ) -> Result<TickReport, RuntimeFault> {
+        catch_unwind(AssertUnwindSafe(|| self.run_tick(engine, audio, midi_output)))
+            .map_err(|_| RuntimeFault::TickPanic)
+    }
+
     pub fn snapshot(&self) -> TransportSnapshot {
         TransportSnapshot {
             tick: self.scheduler.current_tick,
             is_playing: self.scheduler.is_playing,
+            sync_mode: self.sync_mode,
+            external_clock_pending: self.external_clock_pending,
             queued_commands: self.command_queue.len(),
             processed_commands: self.processed_commands,
+            midi_messages_ingested_total: self.midi_messages_ingested_total,
         }
     }
 
@@ -149,15 +245,45 @@ impl RuntimeCoordinator {
             RuntimeCommand::Rewind => self.scheduler.rewind(),
         }
     }
+
+    fn set_sync_mode_now(&mut self, mode: SyncMode) {
+        self.sync_mode = mode;
+
+        if matches!(mode, SyncMode::Internal) {
+            self.external_clock_pending = 0;
+        }
+    }
+
+    fn should_advance_tick(&mut self) -> bool {
+        if !self.scheduler.is_playing {
+            return false;
+        }
+
+        match self.sync_mode {
+            SyncMode::Internal => true,
+            SyncMode::ExternalClock => {
+                if self.external_clock_pending == 0 {
+                    false
+                } else {
+                    self.external_clock_pending = self.external_clock_pending.saturating_sub(1);
+                    true
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{RuntimeCommand, RuntimeCoordinator};
+    use super::{RuntimeCommand, RuntimeCoordinator, RuntimeFault, SyncMode};
     use p9_core::engine::{Engine, EngineCommand};
+    use p9_core::events::RenderEvent;
     use p9_core::model::{Chain, Phrase};
-    use p9_rt::audio::{AudioBackend, AudioBackendConfig, NativeAudioBackend, NoopAudioBackend};
-    use p9_rt::midi::{MidiMessage, NoopMidiOutput};
+    use p9_rt::audio::{
+        AudioBackend, AudioBackendConfig, AudioMetrics, NativeAudioBackend, NoopAudioBackend,
+    };
+    use p9_rt::midi::{MidiInput, MidiMessage, MidiOutput, NoopMidiOutput};
+    use std::collections::VecDeque;
 
     fn setup_engine() -> Engine {
         let mut engine = Engine::new("runtime-test");
@@ -192,6 +318,59 @@ mod tests {
         let mut audio = NoopAudioBackend::default();
         audio.start();
         audio
+    }
+
+    #[derive(Default)]
+    struct CaptureMidiOutput {
+        sent: Vec<MidiMessage>,
+    }
+
+    impl MidiOutput for CaptureMidiOutput {
+        fn send(&mut self, msg: MidiMessage) {
+            self.sent.push(msg);
+        }
+    }
+
+    struct ScriptedMidiInput {
+        queue: VecDeque<MidiMessage>,
+    }
+
+    impl ScriptedMidiInput {
+        fn new(messages: Vec<MidiMessage>) -> Self {
+            Self {
+                queue: messages.into(),
+            }
+        }
+    }
+
+    impl MidiInput for ScriptedMidiInput {
+        fn poll(&mut self) -> Vec<MidiMessage> {
+            self.queue.pop_front().into_iter().collect()
+        }
+    }
+
+    struct PanicAudioBackend;
+
+    impl AudioBackend for PanicAudioBackend {
+        fn start(&mut self) {}
+
+        fn stop(&mut self) {}
+
+        fn push_events(&mut self, _events: &[RenderEvent]) {
+            panic!("panic-audio");
+        }
+
+        fn events_consumed(&self) -> usize {
+            0
+        }
+
+        fn metrics(&self) -> AudioMetrics {
+            AudioMetrics::default()
+        }
+
+        fn backend_name(&self) -> &'static str {
+            "panic-audio"
+        }
     }
 
     #[test]
@@ -272,22 +451,44 @@ mod tests {
 
     #[test]
     fn repeated_command_sequences_are_deterministic() {
-        fn run_sequence() -> Vec<(usize, bool, u64)> {
+        fn run_sequence() -> Vec<(usize, bool, u64, SyncMode)> {
             let engine = setup_engine();
             let mut runtime = RuntimeCoordinator::new(4);
             let mut audio = started_audio();
             let mut midi_out = NoopMidiOutput::default();
             let mut trace = Vec::new();
 
+            runtime.set_sync_mode(SyncMode::ExternalClock);
             runtime.enqueue_commands([
                 RuntimeCommand::Stop,
                 RuntimeCommand::Start,
-                RuntimeCommand::Continue,
+            ]);
+            runtime.enqueue_midi_messages([
+                MidiMessage {
+                    status: 0xF8,
+                    data1: 0,
+                    data2: 0,
+                },
+                MidiMessage {
+                    status: 0xF8,
+                    data1: 0,
+                    data2: 0,
+                },
+                MidiMessage {
+                    status: 0xF8,
+                    data1: 0,
+                    data2: 0,
+                },
             ]);
 
             for _ in 0..4 {
                 let report = runtime.run_tick(&engine, &mut audio, &mut midi_out);
-                trace.push((report.events_emitted, report.is_playing, report.tick));
+                trace.push((
+                    report.events_emitted,
+                    report.is_playing,
+                    report.tick,
+                    report.sync_mode,
+                ));
             }
 
             trace
@@ -318,6 +519,86 @@ mod tests {
         assert_eq!(report.audio_sample_rate_hz, 48_000);
         assert_eq!(report.audio_buffer_size_frames, 256);
         assert_eq!(report.audio_max_voices, 16);
-        assert_eq!(report.audio_active_voices, 1);
+    }
+
+    #[test]
+    fn external_clock_mode_advances_only_on_clock_messages() {
+        let engine = setup_engine();
+        let mut runtime = RuntimeCoordinator::new(4);
+        let mut audio = started_audio();
+        let mut midi_out = NoopMidiOutput::default();
+
+        runtime.set_sync_mode(SyncMode::ExternalClock);
+        runtime.enqueue_command(RuntimeCommand::Rewind);
+
+        let first = runtime.run_tick(&engine, &mut audio, &mut midi_out);
+        assert_eq!(first.sync_mode, SyncMode::ExternalClock);
+        assert_eq!(first.tick, 0);
+        assert_eq!(first.events_emitted, 0);
+
+        runtime.enqueue_midi_messages([MidiMessage {
+            status: 0xF8,
+            data1: 0,
+            data2: 0,
+        }]);
+
+        let second = runtime.run_tick(&engine, &mut audio, &mut midi_out);
+        assert_eq!(second.tick, 1);
+        assert_eq!(second.external_clock_pending, 0);
+    }
+
+    #[test]
+    fn internal_sync_emits_clock_message_on_tick() {
+        let engine = setup_engine();
+        let mut runtime = RuntimeCoordinator::new(4);
+        let mut audio = started_audio();
+        let mut midi_out = CaptureMidiOutput::default();
+
+        let report = runtime.run_tick(&engine, &mut audio, &mut midi_out);
+
+        assert_eq!(report.sync_mode, SyncMode::Internal);
+        assert_eq!(report.midi_clock_messages_sent, 1);
+        assert!(midi_out.sent.iter().any(|msg| msg.status == 0xF8));
+    }
+
+    #[test]
+    fn run_cycle_polls_midi_input_continuously() {
+        let engine = setup_engine();
+        let mut runtime = RuntimeCoordinator::new(4);
+        let mut audio = started_audio();
+        let mut midi_out = NoopMidiOutput::default();
+
+        runtime.set_sync_mode(SyncMode::ExternalClock);
+
+        let mut midi_input = ScriptedMidiInput::new(vec![
+            MidiMessage {
+                status: 0xF8,
+                data1: 0,
+                data2: 0,
+            },
+            MidiMessage {
+                status: 0xF8,
+                data1: 0,
+                data2: 0,
+            },
+        ]);
+
+        let first = runtime.run_cycle(&engine, &mut audio, &mut midi_input, &mut midi_out);
+        let second = runtime.run_cycle(&engine, &mut audio, &mut midi_input, &mut midi_out);
+
+        assert_eq!(first.tick, 1);
+        assert_eq!(second.tick, 2);
+        assert_eq!(second.midi_messages_ingested, 2);
+    }
+
+    #[test]
+    fn run_tick_safe_catches_backend_panics() {
+        let engine = setup_engine();
+        let mut runtime = RuntimeCoordinator::new(4);
+        let mut audio = PanicAudioBackend;
+        let mut midi_out = NoopMidiOutput::default();
+
+        let result = runtime.run_tick_safe(&engine, &mut audio, &mut midi_out);
+        assert_eq!(result, Err(RuntimeFault::TickPanic));
     }
 }

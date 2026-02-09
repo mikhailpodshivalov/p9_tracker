@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+
 use p9_core::events::RenderEvent;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -57,6 +59,59 @@ impl MidiOutput for NoopMidiOutput {
 impl NoopMidiOutput {
     pub fn sent_count(&self) -> usize {
         self.sent_count
+    }
+}
+
+#[derive(Default)]
+pub struct BufferedMidiInput {
+    queue: VecDeque<MidiMessage>,
+}
+
+impl BufferedMidiInput {
+    pub fn push_message(&mut self, message: MidiMessage) {
+        self.queue.push_back(message);
+    }
+
+    pub fn push_messages<I>(&mut self, messages: I)
+    where
+        I: IntoIterator<Item = MidiMessage>,
+    {
+        self.queue.extend(messages);
+    }
+
+    pub fn pending(&self) -> usize {
+        self.queue.len()
+    }
+}
+
+impl MidiInput for BufferedMidiInput {
+    fn poll(&mut self) -> Vec<MidiMessage> {
+        self.queue.drain(..).collect()
+    }
+}
+
+#[derive(Default)]
+pub struct BufferedMidiOutput {
+    sent: Vec<MidiMessage>,
+}
+
+impl MidiOutput for BufferedMidiOutput {
+    fn send(&mut self, msg: MidiMessage) {
+        self.sent.push(msg);
+    }
+}
+
+impl BufferedMidiOutput {
+    pub fn sent_messages(&self) -> &[MidiMessage] {
+        &self.sent
+    }
+
+    pub fn sent_count(&self) -> usize {
+        self.sent.len()
+    }
+
+    pub fn take_all(&mut self) -> Vec<MidiMessage> {
+        std::mem::take(&mut self.sent)
     }
 }
 
@@ -122,10 +177,9 @@ pub fn forward_render_events(events: &[RenderEvent], output: &mut dyn MidiOutput
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_message, forward_render_events, render_event_to_midi, DecodedMidi, MidiMessage,
-        NoopMidiOutput,
+        decode_message, forward_render_events, render_event_to_midi, BufferedMidiInput,
+        BufferedMidiOutput, DecodedMidi, MidiInput, MidiMessage, MidiOutput, NoopMidiOutput,
     };
-    use crate::midi::MidiOutput;
     use p9_core::events::RenderEvent;
     use p9_core::model::SynthWaveform;
 
@@ -232,5 +286,47 @@ mod tests {
             data2: 100,
         });
         assert_eq!(output.sent_count(), 1);
+    }
+
+    #[test]
+    fn buffered_input_drains_messages_in_poll() {
+        let mut input = BufferedMidiInput::default();
+        input.push_messages([
+            MidiMessage {
+                status: 0xFA,
+                data1: 0,
+                data2: 0,
+            },
+            MidiMessage {
+                status: 0xF8,
+                data1: 0,
+                data2: 0,
+            },
+        ]);
+        assert_eq!(input.pending(), 2);
+
+        let polled = input.poll();
+        assert_eq!(polled.len(), 2);
+        assert_eq!(input.pending(), 0);
+    }
+
+    #[test]
+    fn buffered_output_records_messages() {
+        let mut output = BufferedMidiOutput::default();
+        output.send(MidiMessage {
+            status: 0x90,
+            data1: 64,
+            data2: 100,
+        });
+        output.send(MidiMessage {
+            status: 0x80,
+            data1: 64,
+            data2: 0,
+        });
+
+        assert_eq!(output.sent_count(), 2);
+        assert_eq!(output.sent_messages()[0].status, 0x90);
+        assert_eq!(output.take_all().len(), 2);
+        assert_eq!(output.sent_count(), 0);
     }
 }

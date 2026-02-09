@@ -2,7 +2,7 @@
 
 ## Status
 
-- Current stage: `Phase 13 UI alpha workflow completed`
+- Current stage: `Phase 14 export + sync + hardening completed`
 - Main implementation stack: `Rust`
 
 ## Phase 1 Artifacts
@@ -61,6 +61,10 @@
 ## Phase 13 Artifacts
 
 - `docs/phase13_ui_alpha.md`
+
+## Phase 14 Artifacts
+
+- `docs/phase14_export_sync_hardening.md`
 
 ## Forward Plan
 
