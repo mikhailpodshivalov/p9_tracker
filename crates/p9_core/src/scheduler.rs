@@ -380,6 +380,24 @@ mod tests {
     #[test]
     fn groove_changes_step_timing() {
         let mut engine = setup_engine();
+        engine
+            .apply_command(EngineCommand::SetPhraseStep {
+                phrase_id: 0,
+                step_index: 1,
+                note: None,
+                velocity: 90,
+                instrument_id: Some(0),
+            })
+            .unwrap();
+        engine
+            .apply_command(EngineCommand::SetPhraseStep {
+                phrase_id: 0,
+                step_index: 2,
+                note: Some(62),
+                velocity: 90,
+                instrument_id: Some(0),
+            })
+            .unwrap();
 
         let groove = Groove {
             id: 1,

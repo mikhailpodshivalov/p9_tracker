@@ -2,6 +2,9 @@ use p9_core::engine::{Engine, EngineCommand};
 use p9_core::model::{Chain, Groove, Instrument, InstrumentType, Phrase, Scale};
 use p9_core::scheduler::Scheduler;
 use p9_rt::audio::{AudioBackend, NoopAudioBackend};
+use p9_rt::midi::{
+    decode_message, forward_render_events, DecodedMidi, MidiInput, NoopMidiInput, NoopMidiOutput,
+};
 use p9_storage::project::ProjectEnvelope;
 
 fn main() {
@@ -75,11 +78,23 @@ fn main() {
         chain_id: Some(0),
     });
 
+    let mut midi_input = NoopMidiInput;
+    let mut midi_output = NoopMidiOutput::default();
     let mut scheduler = Scheduler::new(24);
+
+    for message in midi_input.poll() {
+        match decode_message(message) {
+            DecodedMidi::Start | DecodedMidi::Continue => scheduler.start(),
+            DecodedMidi::Stop => scheduler.stop(),
+            _ => {}
+        }
+    }
+
     let mut events = Vec::new();
     for _ in 0..24 {
         events.extend(scheduler.tick(&engine));
     }
+    let midi_messages = forward_render_events(&events, &mut midi_output);
 
     let mut audio = NoopAudioBackend::default();
     audio.start();
@@ -92,12 +107,13 @@ fn main() {
     let restored = ProjectEnvelope::from_text(&serialized).expect("storage round-trip");
 
     println!(
-        "p9_tracker stage6 storage: tempo={}, restored_tempo={}, ticks={}, events={}, audio_events={}",
+        "p9_tracker stage7 midi: tempo={}, restored_tempo={}, ticks={}, events={}, audio_events={}, midi_events={}",
         envelope.project.song.tempo,
         restored.project.song.tempo,
         scheduler.current_tick,
         events.len(),
-        audio.events_consumed()
+        audio.events_consumed(),
+        midi_messages
     );
 }
 

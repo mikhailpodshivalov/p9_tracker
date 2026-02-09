@@ -2,7 +2,7 @@
 
 ## Status
 
-- Current stage: `Phase 6 storage round-trip expansion completed`
+- Current stage: `Phase 7 MIDI bridge completed`
 - Main implementation stack: `Rust`
 
 ## Phase 1 Artifacts
@@ -33,3 +33,7 @@
 ## Phase 6 Artifacts
 
 - `docs/phase6_storage_roundtrip.md`
+
+## Phase 7 Artifacts
+
+- `docs/phase7_midi_bridge.md`
