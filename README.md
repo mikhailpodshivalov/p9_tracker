@@ -2,7 +2,7 @@
 
 ## Status
 
-- Current stage: `Phase 5 per-track overrides completed`
+- Current stage: `Phase 6 storage round-trip expansion completed`
 - Main implementation stack: `Rust`
 
 ## Phase 1 Artifacts
@@ -29,3 +29,7 @@
 ## Phase 5 Artifacts
 
 - `docs/phase5_track_overrides.md`
+
+## Phase 6 Artifacts
+
+- `docs/phase6_storage_roundtrip.md`

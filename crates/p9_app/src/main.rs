@@ -92,7 +92,7 @@ fn main() {
     let restored = ProjectEnvelope::from_text(&serialized).expect("storage round-trip");
 
     println!(
-        "p9_tracker stage5 core: tempo={}, restored_tempo={}, ticks={}, events={}, audio_events={}",
+        "p9_tracker stage6 storage: tempo={}, restored_tempo={}, ticks={}, events={}, audio_events={}",
         envelope.project.song.tempo,
         restored.project.song.tempo,
         scheduler.current_tick,
