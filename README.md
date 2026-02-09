@@ -37,3 +37,7 @@
 ## Phase 7 Artifacts
 
 - `docs/phase7_midi_bridge.md`
+
+## Forward Plan
+
+- `docs/phase8_14_plan.md`
