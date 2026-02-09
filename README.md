@@ -2,7 +2,7 @@
 
 ## Status
 
-- Current stage: `Phase 11 fx/table/mixer v1 completed`
+- Current stage: `Phase 12 storage v2 + migration completed`
 - Main implementation stack: `Rust`
 
 ## Phase 1 Artifacts
@@ -53,6 +53,10 @@
 ## Phase 11 Artifacts
 
 - `docs/phase11_fx_table_mixer.md`
+
+## Phase 12 Artifacts
+
+- `docs/phase12_storage_v2.md`
 
 ## Forward Plan
 
