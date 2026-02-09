@@ -23,6 +23,10 @@ fn main() {
     };
     let _ = engine.apply_command(EngineCommand::UpsertGroove { groove });
     let _ = engine.apply_command(EngineCommand::SetDefaultGroove(1));
+    let _ = engine.apply_command(EngineCommand::SetTrackGrooveOverride {
+        track_index: 0,
+        groove_id: Some(1),
+    });
 
     let scale = Scale {
         id: 1,
@@ -31,6 +35,10 @@ fn main() {
     };
     let _ = engine.apply_command(EngineCommand::UpsertScale { scale });
     let _ = engine.apply_command(EngineCommand::SetDefaultScale(1));
+    let _ = engine.apply_command(EngineCommand::SetTrackScaleOverride {
+        track_index: 0,
+        scale_id: Some(1),
+    });
 
     let _ = engine.apply_command(EngineCommand::SetChainRowPhrase {
         chain_id: 0,
@@ -84,7 +92,7 @@ fn main() {
     let restored = ProjectEnvelope::from_text(&serialized).expect("storage round-trip");
 
     println!(
-        "p9_tracker stage4 core: tempo={}, restored_tempo={}, ticks={}, events={}, audio_events={}",
+        "p9_tracker stage5 core: tempo={}, restored_tempo={}, ticks={}, events={}, audio_events={}",
         envelope.project.song.tempo,
         restored.project.song.tempo,
         scheduler.current_tick,

@@ -116,7 +116,7 @@ impl Scheduler {
         let step = phrase.steps.get(state.phrase_step)?;
 
         let note = step.note.map(|raw_note| Self::apply_transpose(raw_note, chain_row.transpose))?;
-        let note = self.apply_scale(project, note);
+        let note = self.apply_scale(project, track_index, note);
 
         Some(RenderEvent::NoteOn {
             track_id: track.index,
@@ -131,12 +131,18 @@ impl Scheduler {
         value.clamp(0, 127) as u8
     }
 
-    fn apply_scale(&self, project: &ProjectData, note: u8) -> u8 {
-        let Some(scale) = project.scales.get(&project.song.default_scale) else {
+    fn apply_scale(&self, project: &ProjectData, track_index: usize, note: u8) -> u8 {
+        let Some(scale) = self.effective_scale(project, track_index) else {
             return note;
         };
 
         Self::quantize_to_scale(note, scale)
+    }
+
+    fn effective_scale<'a>(&self, project: &'a ProjectData, track_index: usize) -> Option<&'a Scale> {
+        let track = project.song.tracks.get(track_index)?;
+        let scale_id = track.scale_override.unwrap_or(project.song.default_scale);
+        project.scales.get(&scale_id)
     }
 
     fn quantize_to_scale(note: u8, scale: &Scale) -> u8 {
@@ -192,7 +198,7 @@ impl Scheduler {
             return self.ticks_per_step;
         }
 
-        let Some(groove) = project.grooves.get(&project.song.default_groove) else {
+        let Some(groove) = self.effective_groove(project, track_index) else {
             return self.ticks_per_step;
         };
 
@@ -207,6 +213,16 @@ impl Scheduler {
         } else {
             value
         }
+    }
+
+    fn effective_groove<'a>(
+        &self,
+        project: &'a ProjectData,
+        track_index: usize,
+    ) -> Option<&'a crate::model::Groove> {
+        let track = project.song.tracks.get(track_index)?;
+        let groove_id = track.groove_override.unwrap_or(project.song.default_groove);
+        project.grooves.get(&groove_id)
     }
 
     fn advance_one_tick(&mut self, project: &ProjectData, track_index: usize) {
@@ -389,6 +405,44 @@ mod tests {
     }
 
     #[test]
+    fn track_groove_override_has_priority() {
+        let mut engine = setup_engine();
+
+        let default_groove = Groove {
+            id: 10,
+            ticks_pattern: vec![2, 2, 2, 2],
+        };
+        let fast_groove = Groove {
+            id: 11,
+            ticks_pattern: vec![1, 1, 1, 1],
+        };
+        engine
+            .apply_command(EngineCommand::UpsertGroove {
+                groove: default_groove,
+            })
+            .unwrap();
+        engine
+            .apply_command(EngineCommand::UpsertGroove { groove: fast_groove })
+            .unwrap();
+        engine
+            .apply_command(EngineCommand::SetDefaultGroove(10))
+            .unwrap();
+        engine
+            .apply_command(EngineCommand::SetTrackGrooveOverride {
+                track_index: 0,
+                groove_id: Some(11),
+            })
+            .unwrap();
+
+        let mut scheduler = Scheduler::new(4);
+        let t1 = scheduler.tick(&engine);
+        let t2 = scheduler.tick(&engine);
+
+        assert_eq!(t1.len(), 1);
+        assert_eq!(t2.len(), 1);
+    }
+
+    #[test]
     fn scale_quantizes_out_of_scale_note() {
         let mut engine = setup_engine();
 
@@ -419,6 +473,54 @@ mod tests {
 
         match &events[0] {
             RenderEvent::NoteOn { note, .. } => assert_eq!(*note, 60),
+            _ => panic!("expected note on"),
+        }
+    }
+
+    #[test]
+    fn track_scale_override_has_priority() {
+        let mut engine = setup_engine();
+
+        let major = Scale {
+            id: 20,
+            key: 0,
+            interval_mask: major_scale_mask(),
+        };
+        let chromatic = Scale {
+            id: 21,
+            key: 0,
+            interval_mask: 0x0FFF,
+        };
+        engine
+            .apply_command(EngineCommand::UpsertScale { scale: major })
+            .unwrap();
+        engine
+            .apply_command(EngineCommand::UpsertScale { scale: chromatic })
+            .unwrap();
+        engine
+            .apply_command(EngineCommand::SetDefaultScale(20))
+            .unwrap();
+        engine
+            .apply_command(EngineCommand::SetTrackScaleOverride {
+                track_index: 0,
+                scale_id: Some(21),
+            })
+            .unwrap();
+        engine
+            .apply_command(EngineCommand::SetPhraseStep {
+                phrase_id: 0,
+                step_index: 0,
+                note: Some(61), // C#
+                velocity: 100,
+                instrument_id: Some(0),
+            })
+            .unwrap();
+
+        let mut scheduler = Scheduler::new(4);
+        let events = scheduler.tick(&engine);
+
+        match &events[0] {
+            RenderEvent::NoteOn { note, .. } => assert_eq!(*note, 61),
             _ => panic!("expected note on"),
         }
     }

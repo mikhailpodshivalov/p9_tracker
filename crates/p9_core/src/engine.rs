@@ -11,6 +11,14 @@ pub enum EngineCommand {
     ToggleTrackMute {
         track_index: usize,
     },
+    SetTrackGrooveOverride {
+        track_index: usize,
+        groove_id: Option<GrooveId>,
+    },
+    SetTrackScaleOverride {
+        track_index: usize,
+        scale_id: Option<ScaleId>,
+    },
     SetSongRowChain {
         track_index: usize,
         row: usize,
@@ -97,6 +105,32 @@ impl Engine {
                     .get_mut(track_index)
                     .ok_or(EngineError::InvalidTrackIndex(track_index))?;
                 track.mute = !track.mute;
+                Ok(())
+            }
+            EngineCommand::SetTrackGrooveOverride {
+                track_index,
+                groove_id,
+            } => {
+                let track = self
+                    .project
+                    .song
+                    .tracks
+                    .get_mut(track_index)
+                    .ok_or(EngineError::InvalidTrackIndex(track_index))?;
+                track.groove_override = groove_id;
+                Ok(())
+            }
+            EngineCommand::SetTrackScaleOverride {
+                track_index,
+                scale_id,
+            } => {
+                let track = self
+                    .project
+                    .song
+                    .tracks
+                    .get_mut(track_index)
+                    .ok_or(EngineError::InvalidTrackIndex(track_index))?;
+                track.scale_override = scale_id;
                 Ok(())
             }
             EngineCommand::SetSongRowChain {

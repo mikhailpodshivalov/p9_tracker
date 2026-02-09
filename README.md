@@ -2,7 +2,7 @@
 
 ## Status
 
-- Current stage: `Phase 4 timing and scale core completed`
+- Current stage: `Phase 5 per-track overrides completed`
 - Main implementation stack: `Rust`
 
 ## Phase 1 Artifacts
@@ -25,3 +25,7 @@
 ## Phase 4 Artifacts
 
 - `docs/phase4_timing_and_scale.md`
+
+## Phase 5 Artifacts
+
+- `docs/phase5_track_overrides.md`

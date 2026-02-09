@@ -53,6 +53,8 @@ pub struct Track {
     pub song_rows: Vec<Option<ChainId>>,
     pub mute: bool,
     pub solo: bool,
+    pub groove_override: Option<GrooveId>,
+    pub scale_override: Option<ScaleId>,
 }
 
 impl Track {
@@ -62,6 +64,8 @@ impl Track {
             song_rows: vec![None; SONG_ROW_COUNT],
             mute: false,
             solo: false,
+            groove_override: None,
+            scale_override: None,
         }
     }
 }
