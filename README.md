@@ -2,7 +2,7 @@
 
 ## Status
 
-- Current stage: `Phase 10 voice engine + instrument v1 completed`
+- Current stage: `Phase 11 fx/table/mixer v1 completed`
 - Main implementation stack: `Rust`
 
 ## Phase 1 Artifacts
@@ -49,6 +49,10 @@
 ## Phase 10 Artifacts
 
 - `docs/phase10_voice_engine.md`
+
+## Phase 11 Artifacts
+
+- `docs/phase11_fx_table_mixer.md`
 
 ## Forward Plan
 

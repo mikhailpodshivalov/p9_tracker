@@ -1,8 +1,8 @@
 use crate::engine::Engine;
 use crate::events::RenderEvent;
 use crate::model::{
-    ChainId, InstrumentId, ProjectData, Scale, SynthParams, PHRASE_STEP_COUNT, SONG_ROW_COUNT,
-    TRACK_COUNT,
+    ChainId, FxCommand, InstrumentId, ProjectData, Scale, SynthParams, PHRASE_STEP_COUNT,
+    SONG_ROW_COUNT, TRACK_COUNT,
 };
 
 #[derive(Clone, Debug, Default)]
@@ -209,15 +209,44 @@ impl Scheduler {
         let phrase = project.phrases.get(&phrase_id)?;
         let step = phrase.steps.get(state.phrase_step)?;
 
-        let note = step.note.map(|raw_note| Self::apply_transpose(raw_note, chain_row.transpose))?;
-        let note = self.apply_scale(project, track_index, note);
-        let note_length_steps = self.resolve_note_length_steps(project, step.instrument_id);
+        let base_note = step.note.map(|raw_note| Self::apply_transpose(raw_note, chain_row.transpose))?;
+        let mut note_i16 = base_note as i16;
+        let mut velocity = step.velocity;
+        let mut note_length_steps = self.resolve_note_length_steps(project, step.instrument_id);
         let synth_params = self.resolve_synth_params(project, step.instrument_id);
+
+        let (fx_note, fx_velocity, fx_length) = Self::apply_fx_commands(
+            note_i16,
+            velocity,
+            note_length_steps,
+            &step.fx,
+        );
+        note_i16 = fx_note;
+        velocity = fx_velocity;
+        note_length_steps = fx_length;
+
+        if let Some(table_row) = self.resolve_table_row(project, step.instrument_id, state.phrase_step) {
+            note_i16 += table_row.note_offset as i16;
+            velocity = ((velocity as u16 * table_row.volume as u16) / 127) as u8;
+
+            let (tbl_note, tbl_velocity, tbl_length) = Self::apply_fx_commands(
+                note_i16,
+                velocity,
+                note_length_steps,
+                &table_row.fx,
+            );
+            note_i16 = tbl_note;
+            velocity = tbl_velocity;
+            note_length_steps = tbl_length;
+        }
+
+        let note = note_i16.clamp(0, 127) as u8;
+        let note = self.apply_scale(project, track_index, note);
 
         Some(StepPlaybackData {
             track_id: track.index,
             note,
-            velocity: step.velocity,
+            velocity,
             instrument_id: step.instrument_id,
             note_length_steps,
             synth_params,
@@ -244,6 +273,47 @@ impl Scheduler {
             .and_then(|id| project.instruments.get(&id))
             .map(|inst| inst.synth_params)
             .unwrap_or_default()
+    }
+
+    fn resolve_table_row<'a>(
+        &self,
+        project: &'a ProjectData,
+        instrument_id: Option<InstrumentId>,
+        phrase_step: usize,
+    ) -> Option<&'a crate::model::TableRow> {
+        let instrument = instrument_id.and_then(|id| project.instruments.get(&id))?;
+        let table_id = instrument.table_id?;
+        let table = project.tables.get(&table_id)?;
+        if table.rows.is_empty() {
+            return None;
+        }
+        let index = phrase_step % table.rows.len();
+        table.rows.get(index)
+    }
+
+    fn apply_fx_commands(
+        mut note_i16: i16,
+        mut velocity: u8,
+        mut note_length_steps: u8,
+        commands: &[Option<FxCommand>],
+    ) -> (i16, u8, u8) {
+        for command in commands.iter().flatten() {
+            match command.code.as_str() {
+                "VOL" => {
+                    velocity = command.value;
+                }
+                "TRN" => {
+                    let transpose = command.value as i16 - 48;
+                    note_i16 += transpose;
+                }
+                "LEN" => {
+                    note_length_steps = command.value.clamp(1, 16);
+                }
+                _ => {}
+            }
+        }
+
+        (note_i16, velocity, note_length_steps)
     }
 
     fn apply_transpose(note: u8, transpose: i8) -> u8 {
@@ -441,7 +511,7 @@ mod tests {
     use super::Scheduler;
     use crate::engine::{Engine, EngineCommand};
     use crate::events::RenderEvent;
-    use crate::model::{Chain, Groove, Instrument, InstrumentType, Phrase, Scale};
+    use crate::model::{Chain, FxCommand, Groove, Instrument, InstrumentType, Phrase, Scale, Table};
 
     fn setup_engine() -> Engine {
         let mut engine = Engine::new("test");
@@ -743,6 +813,124 @@ mod tests {
         assert_eq!(count_note_off(&t2), 0);
         assert_eq!(count_note_off(&t3), 0);
         assert_eq!(count_note_off(&t4), 1);
+    }
+
+    #[test]
+    fn step_fx_transpose_and_volume_are_applied() {
+        let mut engine = setup_engine();
+        engine
+            .apply_command(EngineCommand::SetStepFx {
+                phrase_id: 0,
+                step_index: 0,
+                fx_slot: 0,
+                fx: Some(FxCommand {
+                    code: "TRN".to_string(),
+                    value: 52, // +4 semitones (center=48)
+                }),
+            })
+            .unwrap();
+        engine
+            .apply_command(EngineCommand::SetStepFx {
+                phrase_id: 0,
+                step_index: 0,
+                fx_slot: 1,
+                fx: Some(FxCommand {
+                    code: "VOL".to_string(),
+                    value: 80,
+                }),
+            })
+            .unwrap();
+
+        let mut scheduler = Scheduler::new(4);
+        let events = scheduler.tick(&engine);
+
+        let note_on = events
+            .iter()
+            .find_map(|event| match event {
+                RenderEvent::NoteOn { note, velocity, .. } => Some((*note, *velocity)),
+                _ => None,
+            })
+            .expect("expected note on");
+        assert_eq!(note_on, (64, 80));
+    }
+
+    #[test]
+    fn table_row_modifies_note_and_velocity() {
+        let mut engine = setup_engine();
+        let mut instrument = Instrument::new(0, InstrumentType::Synth, "Tbl");
+        instrument.table_id = Some(0);
+        engine
+            .apply_command(EngineCommand::UpsertInstrument { instrument })
+            .unwrap();
+        let mut table = Table::new(0);
+        table.rows[0].note_offset = 2;
+        table.rows[0].volume = 64;
+        engine
+            .apply_command(EngineCommand::UpsertTable { table })
+            .unwrap();
+
+        engine
+            .apply_command(EngineCommand::SetPhraseStep {
+                phrase_id: 0,
+                step_index: 0,
+                note: Some(60),
+                velocity: 100,
+                instrument_id: Some(0),
+            })
+            .unwrap();
+
+        let mut scheduler = Scheduler::new(4);
+        let events = scheduler.tick(&engine);
+        let note_on = events
+            .iter()
+            .find_map(|event| match event {
+                RenderEvent::NoteOn { note, velocity, .. } => Some((*note, *velocity)),
+                _ => None,
+            })
+            .expect("expected note on");
+
+        assert_eq!(note_on.0, 62);
+        assert_eq!(note_on.1, 50);
+    }
+
+    #[test]
+    fn len_fx_overrides_note_length() {
+        let mut engine = setup_engine();
+        engine
+            .apply_command(EngineCommand::SetStepFx {
+                phrase_id: 0,
+                step_index: 0,
+                fx_slot: 0,
+                fx: Some(FxCommand {
+                    code: "LEN".to_string(),
+                    value: 4,
+                }),
+            })
+            .unwrap();
+        for step in 1..=4 {
+            engine
+                .apply_command(EngineCommand::SetPhraseStep {
+                    phrase_id: 0,
+                    step_index: step,
+                    note: None,
+                    velocity: 90,
+                    instrument_id: Some(0),
+                })
+                .unwrap();
+        }
+
+        let mut scheduler = Scheduler::new(4);
+        let t1 = scheduler.tick(&engine);
+        let t2 = scheduler.tick(&engine);
+        let t3 = scheduler.tick(&engine);
+        let t4 = scheduler.tick(&engine);
+        let t5 = scheduler.tick(&engine);
+
+        assert_eq!(count_note_on(&t1), 1);
+        assert_eq!(count_note_off(&t2), 0);
+        assert_eq!(count_note_off(&t3), 0);
+        assert_eq!(count_note_off(&t4), 0);
+        assert_eq!(count_note_off(&t5), 1);
     }
 
     fn count_note_on(events: &[RenderEvent]) -> usize {

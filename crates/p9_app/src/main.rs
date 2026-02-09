@@ -1,7 +1,7 @@
 mod runtime;
 
 use p9_core::engine::{Engine, EngineCommand};
-use p9_core::model::{Chain, Groove, Instrument, InstrumentType, Phrase, Scale};
+use p9_core::model::{Chain, FxCommand, Groove, Instrument, InstrumentType, Phrase, Scale, Table};
 use p9_rt::audio::{
     build_preferred_audio_backend, start_with_noop_fallback, AudioMetrics,
 };
@@ -19,8 +19,19 @@ fn main() {
     let phrase = Phrase::new(0);
     let _ = engine.apply_command(EngineCommand::UpsertPhrase { phrase });
 
-    let instrument = Instrument::new(0, InstrumentType::Synth, "Init Synth");
+    let mut instrument = Instrument::new(0, InstrumentType::Synth, "Init Synth");
+    instrument.table_id = Some(0);
+    instrument.note_length_steps = 2;
     let _ = engine.apply_command(EngineCommand::UpsertInstrument { instrument });
+
+    let table = Table::new(0);
+    let _ = engine.apply_command(EngineCommand::UpsertTable { table });
+    let _ = engine.apply_command(EngineCommand::SetTableRow {
+        table_id: 0,
+        row: 0,
+        note_offset: 2,
+        volume: 96,
+    });
 
     let groove = Groove {
         id: 1,
@@ -73,11 +84,39 @@ fn main() {
         velocity: 100,
         instrument_id: Some(0),
     });
+    let _ = engine.apply_command(EngineCommand::SetStepFx {
+        phrase_id: 0,
+        step_index: 0,
+        fx_slot: 0,
+        fx: Some(FxCommand {
+            code: "TRN".to_string(),
+            value: 52,
+        }),
+    });
+    let _ = engine.apply_command(EngineCommand::SetStepFx {
+        phrase_id: 0,
+        step_index: 0,
+        fx_slot: 1,
+        fx: Some(FxCommand {
+            code: "VOL".to_string(),
+            value: 90,
+        }),
+    });
 
     let _ = engine.apply_command(EngineCommand::SetSongRowChain {
         track_index: 0,
         row: 0,
         chain_id: Some(0),
+    });
+    let _ = engine.apply_command(EngineCommand::SetTrackLevel {
+        track_index: 0,
+        level: 100,
+    });
+    let _ = engine.apply_command(EngineCommand::SetMasterLevel { level: 110 });
+    let _ = engine.apply_command(EngineCommand::SetMixerSends {
+        mfx: 20,
+        delay: 30,
+        reverb: 40,
     });
 
     let mut started_audio = start_with_noop_fallback(build_preferred_audio_backend(true));
@@ -125,7 +164,7 @@ fn main() {
     let restored = ProjectEnvelope::from_text(&serialized).expect("storage round-trip");
 
     println!(
-        "p9_tracker stage10 voice: tempo={}, restored_tempo={}, ticks={}, playing={}, events={}, audio_events={}, midi_events={}, processed_commands={}, backend={}, fallback={}, callbacks={}, xruns={}, last_callback_us={}, avg_callback_us={}, sample_rate={}, buffer_size={}, active_voices={}, max_voices={}, voice_steals={}",
+        "p9_tracker stage11 fx-table-mixer: tempo={}, restored_tempo={}, ticks={}, playing={}, events={}, audio_events={}, midi_events={}, processed_commands={}, backend={}, fallback={}, callbacks={}, xruns={}, last_callback_us={}, avg_callback_us={}, sample_rate={}, buffer_size={}, active_voices={}, max_voices={}, voice_steals={}",
         envelope.project.song.tempo,
         restored.project.song.tempo,
         transport.tick,
