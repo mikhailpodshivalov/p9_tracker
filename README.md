@@ -2,7 +2,7 @@
 
 ## Status
 
-- Current stage: `Phase 14 export + sync + hardening completed`
+- Current stage: `Phase 15.1 UI shell completed`
 - Main implementation stack: `Rust`
 
 ## Phase 1 Artifacts
@@ -65,6 +65,10 @@
 ## Phase 14 Artifacts
 
 - `docs/phase14_export_sync_hardening.md`
+
+## Phase 15.1 Artifacts
+
+- `docs/phase15_1_ui_shell.md`
 
 ## Forward Plan
 
