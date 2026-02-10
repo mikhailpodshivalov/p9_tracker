@@ -2,7 +2,7 @@
 
 ## Status
 
-- Current stage: `Phase 17.4 project session workflow v1 completed`
+- Current stage: `Phase 18.1 step editor parity completed`
 - Main implementation stack: `Rust`
 
 ## Phase 1 Artifacts
@@ -105,6 +105,10 @@
 ## Phase 17.4 Artifacts
 
 - `docs/phase17_4_project_session_workflow.md`
+
+## Phase 18.1 Artifacts
+
+- `docs/phase18_1_step_editor_parity.md`
 
 ## Forward Plan
 

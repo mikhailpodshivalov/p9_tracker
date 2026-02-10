@@ -87,7 +87,7 @@ pub fn run_web_shell(
     listener.set_nonblocking(true)?;
 
     println!(
-        "p9_tracker gui-shell stage17.4 running at http://{}",
+        "p9_tracker gui-shell stage18.1 running at http://{}",
         listener.local_addr()?
     );
     println!("Open this URL in browser. Press Ctrl+C or click Quit GUI Shell to stop.");
@@ -197,6 +197,7 @@ fn handle_connection(
             let outcome = if let Some(name) = cmd {
                 execute_action_command(
                     name,
+                    query,
                     path.as_deref(),
                     force,
                     ui,
@@ -239,6 +240,7 @@ fn handle_connection(
 
 fn execute_action_command(
     command: &str,
+    query: Option<&str>,
     path: Option<&str>,
     force: bool,
     ui: &mut UiController,
@@ -370,7 +372,7 @@ fn execute_action_command(
             }
         }
         _ => ActionOutcome {
-            status: apply_gui_command(command, ui, engine, runtime),
+            status: apply_gui_command_with_query(command, query, ui, engine, runtime),
             quit: false,
             confirm_required: false,
         },
@@ -413,8 +415,19 @@ fn register_recent_path(session_state: &mut GuiSessionState, path: PathBuf) {
     }
 }
 
+#[cfg(test)]
 fn apply_gui_command(
     command: &str,
+    ui: &mut UiController,
+    engine: &mut Engine,
+    runtime: &mut RuntimeCoordinator,
+) -> String {
+    apply_gui_command_with_query(command, None, ui, engine, runtime)
+}
+
+fn apply_gui_command_with_query(
+    command: &str,
+    query: Option<&str>,
     ui: &mut UiController,
     engine: &mut Engine,
     runtime: &mut RuntimeCoordinator,
@@ -427,6 +440,147 @@ fn apply_gui_command(
         "stop" => {
             runtime.enqueue_command(RuntimeCommand::Stop);
             return String::from("info: transport stop queued");
+        }
+        "edit_bind_chain" => {
+            let snapshot = ui.snapshot(engine, runtime);
+            let chain_id = snapshot.selected_song_row as u8;
+
+            if let Err(err) = ui.handle_action(UiAction::EnsureChain { chain_id }, engine, runtime) {
+                return format!("error: action 'edit_bind_chain' failed: {}", ui_error_label(err));
+            }
+            if let Err(err) = ui.handle_action(
+                UiAction::BindTrackRowToChain {
+                    song_row: snapshot.selected_song_row,
+                    chain_id: Some(chain_id),
+                },
+                engine,
+                runtime,
+            ) {
+                return format!("error: action 'edit_bind_chain' failed: {}", ui_error_label(err));
+            }
+
+            return format!(
+                "info: edit -> bind song row {} to chain {}",
+                snapshot.selected_song_row, chain_id
+            );
+        }
+        "edit_bind_phrase" => {
+            let snapshot = ui.snapshot(engine, runtime);
+            let Some(chain_id) = bound_chain_id(engine.snapshot(), snapshot) else {
+                return String::from("warn: no chain on selected song row; run edit_bind_chain first");
+            };
+            let phrase_id = (snapshot.selected_song_row * CHAIN_VIEW_ROWS + snapshot.selected_chain_row) as u8;
+
+            if let Err(err) = ui.handle_action(UiAction::EnsurePhrase { phrase_id }, engine, runtime) {
+                return format!("error: action 'edit_bind_phrase' failed: {}", ui_error_label(err));
+            }
+            if let Err(err) = ui.handle_action(UiAction::SelectPhrase(phrase_id), engine, runtime) {
+                return format!("error: action 'edit_bind_phrase' failed: {}", ui_error_label(err));
+            }
+            if let Err(err) = ui.handle_action(
+                UiAction::BindChainRowToPhrase {
+                    chain_id,
+                    chain_row: snapshot.selected_chain_row,
+                    phrase_id: Some(phrase_id),
+                    transpose: 0,
+                },
+                engine,
+                runtime,
+            ) {
+                return format!("error: action 'edit_bind_phrase' failed: {}", ui_error_label(err));
+            }
+
+            return format!(
+                "info: edit -> bind chain {} row {} to phrase {}",
+                chain_id, snapshot.selected_chain_row, phrase_id
+            );
+        }
+        "edit_ensure_instrument" => {
+            let snapshot = ui.snapshot(engine, runtime);
+            let instrument_id = snapshot.focused_track as u8;
+            if let Err(err) = ui.handle_action(
+                UiAction::EnsureInstrument {
+                    instrument_id,
+                    instrument_type: p9_core::model::InstrumentType::Synth,
+                    name: format!("Track {} Synth", snapshot.focused_track),
+                },
+                engine,
+                runtime,
+            ) {
+                return format!(
+                    "error: action 'edit_ensure_instrument' failed: {}",
+                    ui_error_label(err)
+                );
+            }
+
+            return format!("info: edit -> ensure instrument {}", instrument_id);
+        }
+        "edit_write_step" => {
+            let snapshot = ui.snapshot(engine, runtime);
+            let focused_instrument = snapshot.focused_track as u8;
+            let clear = query_flag(query, "clear");
+
+            let instrument_id = query_value(query, "instrument")
+                .and_then(parse_u8_field)
+                .unwrap_or(focused_instrument);
+            let velocity = query_value(query, "velocity")
+                .and_then(parse_u8_field)
+                .unwrap_or(100);
+            let note = if clear {
+                None
+            } else {
+                Some(
+                    query_value(query, "note")
+                        .and_then(parse_u8_field)
+                        .unwrap_or_else(|| seeded_note(snapshot.selected_step)),
+                )
+            };
+
+            if !clear && !engine.snapshot().instruments.contains_key(&instrument_id) {
+                return format!(
+                    "warn: instrument {} missing; run edit_ensure_instrument first",
+                    instrument_id
+                );
+            }
+
+            let Some(phrase_id) = bound_phrase_id(engine.snapshot(), snapshot) else {
+                return String::from(
+                    "warn: no phrase on selected chain row; run edit_bind_phrase first",
+                );
+            };
+
+            if let Err(err) = ui.handle_action(UiAction::SelectPhrase(phrase_id), engine, runtime) {
+                return format!("error: action 'edit_write_step' failed: {}", ui_error_label(err));
+            }
+            if let Err(err) = ui.handle_action(
+                UiAction::EditStep {
+                    phrase_id,
+                    step_index: snapshot.selected_step,
+                    note,
+                    velocity: if clear { 0x40 } else { velocity },
+                    instrument_id: if clear { None } else { Some(instrument_id) },
+                },
+                engine,
+                runtime,
+            ) {
+                return format!("error: action 'edit_write_step' failed: {}", ui_error_label(err));
+            }
+
+            if clear {
+                return format!(
+                    "info: edit -> phrase {} step {} cleared",
+                    phrase_id, snapshot.selected_step
+                );
+            }
+
+            return format!(
+                "info: edit -> phrase {} step {} note {} vel {} ins {}",
+                phrase_id,
+                snapshot.selected_step,
+                note.unwrap_or_default(),
+                velocity,
+                instrument_id
+            );
         }
         _ => {}
     }
@@ -503,9 +657,10 @@ fn build_state_json(
     let phrase_view = build_phrase_view_json(project, ui_snapshot);
     let mixer_view = build_mixer_view_json(project, ui_snapshot);
     let session_json = build_session_json(session_state);
+    let editor_json = build_editor_json(project, ui_snapshot);
 
     format!(
-        "{{\"screen\":\"{}\",\"transport\":{{\"tick\":{},\"playing\":{},\"tempo\":{}}},\"cursor\":{{\"track\":{},\"song_row\":{},\"chain_row\":{},\"phrase_id\":{},\"step\":{},\"track_level\":{}}},\"status\":{{\"transport\":\"{}\",\"recovery\":\"{}\",\"dirty\":{},\"autosave\":\"{}\",\"queued_commands\":{},\"processed_commands\":{}}},\"session\":{},\"scale_highlight\":\"{:?}\",\"views\":{{\"song\":{},\"chain\":{},\"phrase\":{},\"mixer\":{}}}}}",
+        "{{\"screen\":\"{}\",\"transport\":{{\"tick\":{},\"playing\":{},\"tempo\":{}}},\"cursor\":{{\"track\":{},\"song_row\":{},\"chain_row\":{},\"phrase_id\":{},\"step\":{},\"track_level\":{}}},\"status\":{{\"transport\":\"{}\",\"recovery\":\"{}\",\"dirty\":{},\"autosave\":\"{}\",\"queued_commands\":{},\"processed_commands\":{}}},\"session\":{},\"editor\":{},\"scale_highlight\":\"{:?}\",\"views\":{{\"song\":{},\"chain\":{},\"phrase\":{},\"mixer\":{}}}}}",
         screen_label(ui_snapshot.screen),
         transport.tick,
         transport.is_playing,
@@ -523,6 +678,7 @@ fn build_state_json(
         transport.queued_commands,
         transport.processed_commands,
         session_json,
+        editor_json,
         ui_snapshot.scale_highlight,
         song_view,
         chain_view,
@@ -585,6 +741,22 @@ fn build_session_json(session_state: &GuiSessionState) -> String {
         "{{\"current_path\":{},\"recent\":[{}]}}",
         option_path_json(session_state.current_project_path.as_deref()),
         recent_paths_json(&session_state.recent_project_paths)
+    )
+}
+
+fn build_editor_json(project: &ProjectData, snapshot: UiSnapshot) -> String {
+    let bound_chain = bound_chain_id(project, snapshot);
+    let bound_phrase = bound_phrase_id(project, snapshot);
+    let focused_instrument = snapshot.focused_track as u8;
+    let instrument_ready = project.instruments.contains_key(&focused_instrument);
+
+    format!(
+        "{{\"target\":\"{}\",\"focused_instrument\":{},\"instrument_ready\":{},\"bound_chain_id\":{},\"bound_phrase_id\":{}}}",
+        json_escape(&editor_target_label(snapshot, bound_chain, bound_phrase)),
+        focused_instrument,
+        instrument_ready,
+        option_u8_json(bound_chain),
+        option_u8_json(bound_phrase),
     )
 }
 
@@ -804,6 +976,35 @@ fn option_u8_json(value: Option<u8>) -> String {
     value
         .map(|item| item.to_string())
         .unwrap_or_else(|| String::from("null"))
+}
+
+fn editor_target_label(snapshot: UiSnapshot, chain_id: Option<u8>, phrase_id: Option<u8>) -> String {
+    format!(
+        "track={} song_row={} chain_row={} chain={} phrase={} step={}",
+        snapshot.focused_track,
+        snapshot.selected_song_row,
+        snapshot.selected_chain_row,
+        chain_id
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| String::from("--")),
+        phrase_id
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| String::from("--")),
+        snapshot.selected_step,
+    )
+}
+
+fn parse_u8_field(value: &str) -> Option<u8> {
+    value.trim().parse::<u8>().ok()
+}
+
+fn seeded_note(step_index: usize) -> u8 {
+    const MAJOR: [u8; 7] = [0, 2, 4, 5, 7, 9, 11];
+    let octave = (step_index / MAJOR.len()) as u8;
+    let interval = MAJOR[step_index % MAJOR.len()];
+    60u8
+        .saturating_add(interval)
+        .saturating_add(octave.saturating_mul(12))
 }
 
 fn option_path_json(path: Option<&Path>) -> String {
@@ -1099,8 +1300,8 @@ footer { margin-top: 12px; color: var(--muted); font-size: 0.85rem; }
 <body>
 <main>
   <header>
-    <h1>P9 Tracker GUI Shell (Phase 17.4)</h1>
-    <span class="small">project session workflow v1</span>
+    <h1>P9 Tracker GUI Shell (Phase 18.1)</h1>
+    <span class="small">step editor parity + explicit edit target</span>
   </header>
 
   <section class="panel">
@@ -1137,7 +1338,7 @@ footer { margin-top: 12px; color: var(--muted); font-size: 0.85rem; }
         <button onclick="sendCmd('toggle_scale')">Toggle Scale Hint</button>
       </div>
       <div class="small" style="margin-top:10px">
-        Keys: Space/T toggle, G play, S stop, R rewind, arrows or H/J/K/L move, N/P switch screen, Ctrl+S save, Q quit.
+        Keys: Space/T toggle, G play, S stop, R rewind, arrows or H/J/K/L move, N/P switch screen, C/F/I/E edit flow, Ctrl+S save, Q quit.
       </div>
     </div>
 
@@ -1170,6 +1371,26 @@ footer { margin-top: 12px; color: var(--muted); font-size: 0.85rem; }
     <div class="kv" style="margin-top:8px"><span>Current Path</span><strong id="session-current">-</strong></div>
     <div class="small" style="margin-top:8px">Recent projects:</div>
     <ul id="recent-list" class="recent-list"><li>none</li></ul>
+  </section>
+
+  <section class="panel">
+    <h3>Step Editor</h3>
+    <div class="kv"><span>Edit Target</span><strong id="editor-target">-</strong></div>
+    <div class="kv"><span>Bound Chain / Phrase</span><strong id="editor-bindings">-</strong></div>
+    <div class="kv"><span>Focused Instrument</span><strong id="editor-instrument">-</strong></div>
+    <div class="controls" style="margin-top:8px">
+      <button onclick="sendCmd('edit_bind_chain')">Bind Chain (c)</button>
+      <button onclick="sendCmd('edit_bind_phrase')">Bind Phrase (f)</button>
+      <button onclick="sendCmd('edit_ensure_instrument')">Ensure Inst (i)</button>
+      <button onclick="editWriteStep()">Write Step (e)</button>
+      <button onclick="sendCmd('edit_write_step', { clear: 1 })">Clear Step</button>
+    </div>
+    <div class="controls" style="margin-top:8px">
+      <input id="edit-note" type="text" placeholder="note 0..127 (empty=seeded)" />
+      <input id="edit-velocity" type="text" placeholder="velocity 1..127 (default 100)" />
+      <input id="edit-instrument" type="text" placeholder="instrument id (default focused)" />
+    </div>
+    <div class="small" style="margin-top:8px">Safety tags are returned as <code>info/warn/error</code> in Last Command.</div>
   </section>
 
   <section class="panel">
@@ -1227,7 +1448,7 @@ footer { margin-top: 12px; color: var(--muted); font-size: 0.85rem; }
   </section>
 
   <footer>
-    Phase 17.4 goal: project new/open/save/save-as/recent workflow is available in GUI with dirty confirmations.
+    Phase 18.1 goal: GUI step editing parity for c/f/i/e flow with explicit cursor target and safety statuses.
   </footer>
 </main>
 
@@ -1251,6 +1472,10 @@ const keyMap = {
   KeyN: 'screen_next',
   KeyP: 'screen_prev',
   KeyX: 'toggle_scale',
+  KeyC: 'edit_bind_chain',
+  KeyF: 'edit_bind_phrase',
+  KeyI: 'edit_ensure_instrument',
+  KeyE: 'edit_write_step',
   KeyQ: 'quit',
 };
 
@@ -1388,6 +1613,30 @@ function sessionSaveAs() {
   sendCmd('session_save_as', { path });
 }
 
+function readOptionalNumberInput(id) {
+  const value = document.getElementById(id).value.trim();
+  if (!value) {
+    return null;
+  }
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed)) {
+    return null;
+  }
+  return parsed;
+}
+
+function editWriteStep() {
+  const note = readOptionalNumberInput('edit-note');
+  const velocity = readOptionalNumberInput('edit-velocity');
+  const instrument = readOptionalNumberInput('edit-instrument');
+
+  sendCmd('edit_write_step', {
+    note,
+    velocity,
+    instrument,
+  });
+}
+
 async function refreshState() {
   try {
     const response = await fetch('/state');
@@ -1397,6 +1646,7 @@ async function refreshState() {
     const cursor = state.cursor;
     const status = state.status;
     const session = state.session;
+    const editor = state.editor;
 
     document.getElementById('tick').textContent = transport.tick;
     document.getElementById('playing').textContent = transport.playing ? 'yes' : 'no';
@@ -1413,6 +1663,9 @@ async function refreshState() {
     document.getElementById('autosave-state').textContent = status.autosave;
     document.getElementById('queue-state').textContent = `${status.queued_commands} queued / ${status.processed_commands} processed`;
     document.getElementById('session-current').textContent = session.current_path || '-';
+    document.getElementById('editor-target').textContent = editor.target;
+    document.getElementById('editor-bindings').textContent = `${fmtOptional(editor.bound_chain_id, true)} / ${fmtOptional(editor.bound_phrase_id, true)}`;
+    document.getElementById('editor-instrument').textContent = `${editor.focused_instrument} (${editor.instrument_ready ? 'ready' : 'missing'})`;
 
     renderSong(state.views.song);
     renderChain(state.views.chain);
@@ -1428,9 +1681,17 @@ async function refreshState() {
 async function sendCmd(cmd, options = {}) {
   const params = new URLSearchParams();
   params.set('cmd', cmd);
-  if (options.path) {
-    params.set('path', options.path);
-  }
+  Object.entries(options).forEach(([key, value]) => {
+    if (value === undefined || value === null || value === false || value === '') {
+      return;
+    }
+    if (value === true) {
+      params.set(key, '1');
+      return;
+    }
+    params.set(key, String(value));
+  });
+
   if (options.force) {
     params.set('force', '1');
   }
@@ -1508,8 +1769,8 @@ refreshState();
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_gui_command, build_state_json, execute_action_command, parse_request_line, query_value,
-        split_path_and_query, GuiSessionState,
+        apply_gui_command, apply_gui_command_with_query, build_state_json, execute_action_command,
+        parse_request_line, query_value, split_path_and_query, GuiSessionState,
     };
     use crate::hardening::{DirtyStateTracker, RecoveryStatus};
     use crate::runtime::RuntimeCoordinator;
@@ -1587,6 +1848,48 @@ mod tests {
     }
 
     #[test]
+    fn edit_flow_parity_c_f_i_e_writes_step() {
+        let mut ui = UiController::default();
+        let mut engine = Engine::new("gui");
+        let mut runtime = RuntimeCoordinator::new(24);
+
+        let c = apply_gui_command("edit_bind_chain", &mut ui, &mut engine, &mut runtime);
+        let f = apply_gui_command("edit_bind_phrase", &mut ui, &mut engine, &mut runtime);
+        let i = apply_gui_command("edit_ensure_instrument", &mut ui, &mut engine, &mut runtime);
+        let e = apply_gui_command_with_query(
+            "edit_write_step",
+            Some("note=72&velocity=101&instrument=0"),
+            &mut ui,
+            &mut engine,
+            &mut runtime,
+        );
+
+        assert!(c.starts_with("info:"));
+        assert!(f.starts_with("info:"));
+        assert!(i.starts_with("info:"));
+        assert!(e.starts_with("info:"));
+
+        let project = engine.snapshot();
+        let step = &project.phrases.get(&0).unwrap().steps[0];
+        assert_eq!(step.note, Some(72));
+        assert_eq!(step.velocity, 101);
+        assert_eq!(step.instrument_id, Some(0));
+    }
+
+    #[test]
+    fn edit_write_step_warns_when_phrase_not_bound() {
+        let mut ui = UiController::default();
+        let mut engine = Engine::new("gui");
+        let mut runtime = RuntimeCoordinator::new(24);
+
+        let _ = apply_gui_command("edit_ensure_instrument", &mut ui, &mut engine, &mut runtime);
+        let warn = apply_gui_command("edit_write_step", &mut ui, &mut engine, &mut runtime);
+
+        assert!(warn.starts_with("warn:"));
+        assert!(warn.contains("edit_bind_phrase"));
+    }
+
+    #[test]
     fn session_new_requires_confirmation_when_dirty() {
         let mut ui = UiController::default();
         let mut engine = Engine::new("gui");
@@ -1597,6 +1900,7 @@ mod tests {
 
         let outcome = execute_action_command(
             "session_new",
+            None,
             None,
             false,
             &mut ui,
@@ -1641,6 +1945,7 @@ mod tests {
 
         let save_outcome = execute_action_command(
             "session_save_as",
+            None,
             path.to_str(),
             false,
             &mut ui,
@@ -1657,6 +1962,7 @@ mod tests {
         let new_outcome = execute_action_command(
             "session_new",
             None,
+            None,
             true,
             &mut ui,
             &mut engine,
@@ -1669,6 +1975,7 @@ mod tests {
 
         let open_outcome = execute_action_command(
             "session_open",
+            None,
             path.to_str(),
             false,
             &mut ui,
@@ -1703,6 +2010,7 @@ mod tests {
         assert!(json.contains("\"transport\":{"));
         assert!(json.contains("\"status\":{"));
         assert!(json.contains("\"session\":{"));
+        assert!(json.contains("\"editor\":{"));
         assert!(json.contains("\"recovery\":\"clean-start\""));
         assert!(json.contains("\"views\":{"));
         assert!(json.contains("\"song\":{"));

@@ -318,7 +318,7 @@ fn main() {
         .expect("autosave failed");
 
     println!(
-        "p9_tracker stage17.4 project-session-workflow: tempo={}, restored_tempo={}, ticks={}, playing={}, sync_mode={:?}, external_clock_pending={}, events={}, audio_events={}, midi_events={}, midi_clock_events={}, midi_ingested={}, midi_out_messages={}, processed_commands={}, backend={}, fallback={}, callbacks={}, xruns={}, last_callback_us={}, avg_callback_us={}, sample_rate={}, buffer_size={}, active_voices={}, max_voices={}, voice_steals={}, ui_screen={:?}, ui_track={}, ui_song_row={}, ui_chain_row={}, ui_phrase={}, ui_step={}, ui_scale_highlight={:?}, ui_track_level={}, export_ticks={}, export_events={}, export_samples={}, export_peak={}, export_path={}, autosave_written={}, autosave_tick={}, autosave_path={}, ui_shell_mode_supported={}",
+        "p9_tracker stage18.1 step-editor-parity: tempo={}, restored_tempo={}, ticks={}, playing={}, sync_mode={:?}, external_clock_pending={}, events={}, audio_events={}, midi_events={}, midi_clock_events={}, midi_ingested={}, midi_out_messages={}, processed_commands={}, backend={}, fallback={}, callbacks={}, xruns={}, last_callback_us={}, avg_callback_us={}, sample_rate={}, buffer_size={}, active_voices={}, max_voices={}, voice_steals={}, ui_screen={:?}, ui_track={}, ui_song_row={}, ui_chain_row={}, ui_phrase={}, ui_step={}, ui_scale_highlight={:?}, ui_track_level={}, export_ticks={}, export_events={}, export_samples={}, export_peak={}, export_path={}, autosave_written={}, autosave_tick={}, autosave_path={}, ui_shell_mode_supported={}",
         envelope.project.song.tempo,
         restored.project.song.tempo,
         transport.tick,
