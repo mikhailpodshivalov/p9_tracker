@@ -2,7 +2,7 @@
 
 ## Status
 
-- Current stage: `Phase 16.1 undo/redo foundation completed`
+- Current stage: `Phase 16.2 selection and block operations completed`
 - Main implementation stack: `Rust`
 
 ## Phase 1 Artifacts
@@ -86,6 +86,7 @@
 
 - `docs/phase16_plan.md`
 - `docs/phase16_1_undo_redo_foundation.md`
+- `docs/phase16_2_selection_block_ops.md`
 
 ## Forward Plan
 
