@@ -1,6 +1,6 @@
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::hardening::{
@@ -14,6 +14,7 @@ use p9_core::engine::Engine;
 use p9_core::model::{ProjectData, Step, CHAIN_ROW_COUNT, PHRASE_STEP_COUNT, SONG_ROW_COUNT};
 use p9_rt::audio::{AudioBackend, NoopAudioBackend};
 use p9_rt::midi::NoopMidiOutput;
+use p9_storage::project::ProjectEnvelope;
 
 const BIND_ADDR_CANDIDATES: [&str; 5] = [
     "127.0.0.1:17717",
@@ -26,6 +27,7 @@ const TICK_SLEEP_MS: u64 = 16;
 const GUI_AUTOSAVE_INTERVAL_TICKS: u64 = 16;
 const SONG_VIEW_ROWS: usize = 8;
 const CHAIN_VIEW_ROWS: usize = 8;
+const RECENT_PROJECT_LIMIT: usize = 6;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LoopControl {
@@ -38,6 +40,8 @@ struct GuiSessionState {
     recovery: RecoveryStatus,
     dirty: bool,
     autosave_status: String,
+    current_project_path: Option<PathBuf>,
+    recent_project_paths: Vec<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -46,12 +50,21 @@ struct SessionHardeningState {
     autosave_status: String,
 }
 
+#[derive(Clone, Debug)]
+struct ActionOutcome {
+    status: String,
+    quit: bool,
+    confirm_required: bool,
+}
+
 impl GuiSessionState {
     fn new(recovery: RecoveryStatus) -> Self {
         Self {
             recovery,
             dirty: false,
             autosave_status: String::from("unknown"),
+            current_project_path: None,
+            recent_project_paths: Vec::new(),
         }
     }
 }
@@ -74,7 +87,7 @@ pub fn run_web_shell(
     listener.set_nonblocking(true)?;
 
     println!(
-        "p9_tracker gui-shell stage17.3 running at http://{}",
+        "p9_tracker gui-shell stage17.4 running at http://{}",
         listener.local_addr()?
     );
     println!("Open this URL in browser. Press Ctrl+C or click Quit GUI Shell to stop.");
@@ -96,7 +109,14 @@ pub fn run_web_shell(
     loop {
         match listener.accept() {
             Ok((mut stream, _)) => {
-                if handle_connection(&mut stream, ui, engine, runtime, &session_state)?
+                if handle_connection(
+                    &mut stream,
+                    ui,
+                    engine,
+                    runtime,
+                    &mut session_state,
+                    &mut dirty_tracker,
+                )?
                     == LoopControl::Quit
                 {
                     break;
@@ -142,7 +162,8 @@ fn handle_connection(
     ui: &mut UiController,
     engine: &mut Engine,
     runtime: &mut RuntimeCoordinator,
-    session_state: &GuiSessionState,
+    session_state: &mut GuiSessionState,
+    dirty_tracker: &mut DirtyStateTracker,
 ) -> io::Result<LoopControl> {
     let mut buffer = [0u8; 8192];
     let read = stream.read(&mut buffer)?;
@@ -170,38 +191,225 @@ fn handle_connection(
         }
         (_, "/action") => {
             let cmd = query_value(query, "cmd");
-            let control = if matches!(cmd, Some("quit")) {
-                LoopControl::Quit
-            } else {
-                LoopControl::Continue
-            };
+            let force = query_flag(query, "force");
+            let path = query_value(query, "path").map(url_decode);
 
-            let status = if let Some(name) = cmd {
-                if name == "quit" {
-                    String::from("info: quitting gui shell")
-                } else {
-                    apply_gui_command(name, ui, engine, runtime)
-                }
+            let outcome = if let Some(name) = cmd {
+                execute_action_command(
+                    name,
+                    path.as_deref(),
+                    force,
+                    ui,
+                    engine,
+                    runtime,
+                    session_state,
+                    dirty_tracker,
+                )
             } else {
-                String::from("warn: missing cmd parameter")
+                ActionOutcome {
+                    status: String::from("warn: missing cmd parameter"),
+                    quit: false,
+                    confirm_required: false,
+                }
             };
 
             let body = format!(
-                "{{\"status\":\"{}\",\"quit\":{}}}",
-                json_escape(&status),
-                if control == LoopControl::Quit {
+                "{{\"status\":\"{}\",\"quit\":{},\"confirm_required\":{}}}",
+                json_escape(&outcome.status),
+                if outcome.quit { "true" } else { "false" },
+                if outcome.confirm_required {
                     "true"
                 } else {
                     "false"
-                }
+                },
             );
             write_text_response(stream, 200, "application/json; charset=utf-8", &body)?;
-            Ok(control)
+            Ok(if outcome.quit {
+                LoopControl::Quit
+            } else {
+                LoopControl::Continue
+            })
         }
         _ => {
             write_text_response(stream, 404, "text/plain; charset=utf-8", "not found")?;
             Ok(LoopControl::Continue)
         }
+    }
+}
+
+fn execute_action_command(
+    command: &str,
+    path: Option<&str>,
+    force: bool,
+    ui: &mut UiController,
+    engine: &mut Engine,
+    runtime: &mut RuntimeCoordinator,
+    session_state: &mut GuiSessionState,
+    dirty_tracker: &mut DirtyStateTracker,
+) -> ActionOutcome {
+    if requires_dirty_confirmation(command) && session_state.dirty && !force {
+        return ActionOutcome {
+            status: format!("warn: unsaved changes; confirm '{command}' with force=1"),
+            quit: false,
+            confirm_required: true,
+        };
+    }
+
+    match command {
+        "quit" => ActionOutcome {
+            status: String::from("info: quitting gui shell"),
+            quit: true,
+            confirm_required: false,
+        },
+        "session_new" => {
+            engine.replace_project(ProjectData::new("p9_tracker new song"));
+            *ui = UiController::default();
+            runtime.enqueue_commands([RuntimeCommand::Stop, RuntimeCommand::Rewind]);
+            session_state.current_project_path = None;
+            session_state.dirty = false;
+            session_state.autosave_status = String::from("clean");
+            dirty_tracker.mark_saved(engine);
+            ActionOutcome {
+                status: String::from("info: new project created"),
+                quit: false,
+                confirm_required: false,
+            }
+        }
+        "session_open" => {
+            let Some(target_path) = normalize_path(path) else {
+                return ActionOutcome {
+                    status: String::from("warn: open requires path parameter"),
+                    quit: false,
+                    confirm_required: false,
+                };
+            };
+
+            match load_project_from_path(&target_path, engine) {
+                Ok(()) => {
+                    *ui = UiController::default();
+                    runtime.enqueue_commands([RuntimeCommand::Stop, RuntimeCommand::Rewind]);
+                    dirty_tracker.mark_saved(engine);
+                    session_state.dirty = false;
+                    session_state.autosave_status = String::from("loaded");
+                    session_state.current_project_path = Some(target_path.clone());
+                    register_recent_path(session_state, target_path);
+                    ActionOutcome {
+                        status: String::from("info: project opened"),
+                        quit: false,
+                        confirm_required: false,
+                    }
+                }
+                Err(err) => ActionOutcome {
+                    status: format!("error: open failed: {err}"),
+                    quit: false,
+                    confirm_required: false,
+                },
+            }
+        }
+        "session_save" | "session_save_as" => {
+            let save_as = command == "session_save_as";
+            let explicit_path = normalize_path(path);
+            let target_path = if save_as {
+                match explicit_path {
+                    Some(path) => path,
+                    None => {
+                        return ActionOutcome {
+                            status: String::from("warn: save-as requires path parameter"),
+                            quit: false,
+                            confirm_required: false,
+                        };
+                    }
+                }
+            } else if let Some(path) = explicit_path {
+                path
+            } else if let Some(path) = session_state.current_project_path.clone() {
+                path
+            } else {
+                return ActionOutcome {
+                    status: String::from("warn: no current path; use Save As with path"),
+                    quit: false,
+                    confirm_required: false,
+                };
+            };
+
+            match save_project_to_path(&target_path, engine) {
+                Ok(()) => {
+                    dirty_tracker.mark_saved(engine);
+                    session_state.dirty = false;
+                    session_state.current_project_path = Some(target_path.clone());
+                    register_recent_path(session_state, target_path);
+                    session_state.autosave_status =
+                        format!("saved-manual@{}", runtime.snapshot().tick);
+                    ActionOutcome {
+                        status: String::from("info: project saved"),
+                        quit: false,
+                        confirm_required: false,
+                    }
+                }
+                Err(err) => ActionOutcome {
+                    status: format!("error: save failed: {err}"),
+                    quit: false,
+                    confirm_required: false,
+                },
+            }
+        }
+        "session_recent" => {
+            let recent = session_state
+                .recent_project_paths
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>();
+            ActionOutcome {
+                status: if recent.is_empty() {
+                    String::from("info: recent projects empty")
+                } else {
+                    format!("info: recent: {}", recent.join(" | "))
+                },
+                quit: false,
+                confirm_required: false,
+            }
+        }
+        _ => ActionOutcome {
+            status: apply_gui_command(command, ui, engine, runtime),
+            quit: false,
+            confirm_required: false,
+        },
+    }
+}
+
+fn requires_dirty_confirmation(command: &str) -> bool {
+    matches!(command, "quit" | "session_new" | "session_open")
+}
+
+fn normalize_path(path: Option<&str>) -> Option<PathBuf> {
+    let value = path?.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(value))
+    }
+}
+
+fn save_project_to_path(path: &Path, engine: &Engine) -> Result<(), String> {
+    let envelope = ProjectEnvelope::new(engine.snapshot().clone());
+    std::fs::write(path, envelope.to_text()).map_err(|err| err.to_string())
+}
+
+fn load_project_from_path(path: &Path, engine: &mut Engine) -> Result<(), String> {
+    let source = std::fs::read_to_string(path).map_err(|err| err.to_string())?;
+    let envelope = ProjectEnvelope::from_text(&source).map_err(|err| format!("{err:?}"))?;
+    envelope
+        .validate_format()
+        .map_err(|err| format!("{err:?}"))?;
+    engine.replace_project(envelope.project);
+    Ok(())
+}
+
+fn register_recent_path(session_state: &mut GuiSessionState, path: PathBuf) {
+    session_state.recent_project_paths.retain(|item| item != &path);
+    session_state.recent_project_paths.insert(0, path);
+    if session_state.recent_project_paths.len() > RECENT_PROJECT_LIMIT {
+        session_state.recent_project_paths.truncate(RECENT_PROJECT_LIMIT);
     }
 }
 
@@ -294,9 +502,10 @@ fn build_state_json(
     let chain_view = build_chain_view_json(project, ui_snapshot);
     let phrase_view = build_phrase_view_json(project, ui_snapshot);
     let mixer_view = build_mixer_view_json(project, ui_snapshot);
+    let session_json = build_session_json(session_state);
 
     format!(
-        "{{\"screen\":\"{}\",\"transport\":{{\"tick\":{},\"playing\":{},\"tempo\":{}}},\"cursor\":{{\"track\":{},\"song_row\":{},\"chain_row\":{},\"phrase_id\":{},\"step\":{},\"track_level\":{}}},\"status\":{{\"transport\":\"{}\",\"recovery\":\"{}\",\"dirty\":{},\"autosave\":\"{}\",\"queued_commands\":{},\"processed_commands\":{}}},\"scale_highlight\":\"{:?}\",\"views\":{{\"song\":{},\"chain\":{},\"phrase\":{},\"mixer\":{}}}}}",
+        "{{\"screen\":\"{}\",\"transport\":{{\"tick\":{},\"playing\":{},\"tempo\":{}}},\"cursor\":{{\"track\":{},\"song_row\":{},\"chain_row\":{},\"phrase_id\":{},\"step\":{},\"track_level\":{}}},\"status\":{{\"transport\":\"{}\",\"recovery\":\"{}\",\"dirty\":{},\"autosave\":\"{}\",\"queued_commands\":{},\"processed_commands\":{}}},\"session\":{},\"scale_highlight\":\"{:?}\",\"views\":{{\"song\":{},\"chain\":{},\"phrase\":{},\"mixer\":{}}}}}",
         screen_label(ui_snapshot.screen),
         transport.tick,
         transport.is_playing,
@@ -313,6 +522,7 @@ fn build_state_json(
         json_escape(&session_state.autosave_status),
         transport.queued_commands,
         transport.processed_commands,
+        session_json,
         ui_snapshot.scale_highlight,
         song_view,
         chain_view,
@@ -368,6 +578,14 @@ fn update_session_hardening(
         dirty,
         autosave_status,
     }
+}
+
+fn build_session_json(session_state: &GuiSessionState) -> String {
+    format!(
+        "{{\"current_path\":{},\"recent\":[{}]}}",
+        option_path_json(session_state.current_project_path.as_deref()),
+        recent_paths_json(&session_state.recent_project_paths)
+    )
 }
 
 fn build_song_view_json(project: &ProjectData, snapshot: UiSnapshot) -> String {
@@ -588,6 +806,25 @@ fn option_u8_json(value: Option<u8>) -> String {
         .unwrap_or_else(|| String::from("null"))
 }
 
+fn option_path_json(path: Option<&Path>) -> String {
+    if let Some(path) = path {
+        format!("\"{}\"", json_escape(&path.display().to_string()))
+    } else {
+        String::from("null")
+    }
+}
+
+fn recent_paths_json(paths: &[PathBuf]) -> String {
+    let mut items = String::new();
+    for path in paths {
+        if !items.is_empty() {
+            items.push(',');
+        }
+        items.push_str(&format!("\"{}\"", json_escape(&path.display().to_string())));
+    }
+    items
+}
+
 fn screen_label(screen: UiScreen) -> &'static str {
     match screen {
         UiScreen::Song => "song",
@@ -630,6 +867,47 @@ fn query_value<'a>(query: Option<&'a str>, key: &str) -> Option<&'a str> {
         }
     }
     None
+}
+
+fn query_flag(query: Option<&str>, key: &str) -> bool {
+    matches!(
+        query_value(query, key),
+        Some("1") | Some("true") | Some("yes") | Some("on")
+    )
+}
+
+fn url_decode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let bytes = value.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'+' => {
+                out.push(' ');
+                index += 1;
+            }
+            b'%' if index + 2 < bytes.len() => {
+                let hi = bytes[index + 1];
+                let lo = bytes[index + 2];
+                let hex = [hi, lo];
+                let value = std::str::from_utf8(&hex)
+                    .ok()
+                    .and_then(|digits| u8::from_str_radix(digits, 16).ok());
+                if let Some(decoded) = value {
+                    out.push(decoded as char);
+                    index += 3;
+                } else {
+                    out.push('%');
+                    index += 1;
+                }
+            }
+            other => {
+                out.push(other as char);
+                index += 1;
+            }
+        }
+    }
+    out
 }
 
 fn write_text_response(
@@ -779,7 +1057,21 @@ button {
 }
 button:hover { border-color: var(--accent); }
 button.danger { border-color: #c63b2d; color: #c63b2d; }
+input[type="text"] {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 10px;
+  min-width: 320px;
+  max-width: 100%;
+}
 .kv { display: grid; grid-template-columns: 180px 1fr; gap: 8px; }
+.recent-list {
+  margin: 8px 0 0;
+  padding-left: 16px;
+}
+.recent-list li {
+  margin: 6px 0;
+}
 table {
   width: 100%;
   border-collapse: collapse;
@@ -807,8 +1099,8 @@ footer { margin-top: 12px; color: var(--muted); font-size: 0.85rem; }
 <body>
 <main>
   <header>
-    <h1>P9 Tracker GUI Shell (Phase 17.3)</h1>
-    <span class="small">transport and keyboard input layer</span>
+    <h1>P9 Tracker GUI Shell (Phase 17.4)</h1>
+    <span class="small">project session workflow v1</span>
   </header>
 
   <section class="panel">
@@ -845,7 +1137,7 @@ footer { margin-top: 12px; color: var(--muted); font-size: 0.85rem; }
         <button onclick="sendCmd('toggle_scale')">Toggle Scale Hint</button>
       </div>
       <div class="small" style="margin-top:10px">
-        Keys: Space/T toggle, G play, S stop, R rewind, arrows or H/J/K/L move, N/P switch screen.
+        Keys: Space/T toggle, G play, S stop, R rewind, arrows or H/J/K/L move, N/P switch screen, Ctrl+S save, Q quit.
       </div>
     </div>
 
@@ -861,6 +1153,23 @@ footer { margin-top: 12px; color: var(--muted); font-size: 0.85rem; }
       <div class="kv"><span>Track Level</span><strong id="track-level">-</strong></div>
       <div class="kv"><span>Scale Highlight</span><strong id="scale-highlight">-</strong></div>
     </div>
+  </section>
+
+  <section class="panel">
+    <h3>Session</h3>
+    <div class="controls">
+      <button onclick="sessionNew()">New</button>
+      <button onclick="sessionOpen()">Open Path</button>
+      <button onclick="sessionSave()">Save</button>
+      <button onclick="sessionSaveAs()">Save As Path</button>
+      <button onclick="sendCmd('session_recent')">Recent</button>
+    </div>
+    <div class="controls" style="margin-top:8px">
+      <input id="session-path" type="text" placeholder="/absolute/or/relative/project.p9" />
+    </div>
+    <div class="kv" style="margin-top:8px"><span>Current Path</span><strong id="session-current">-</strong></div>
+    <div class="small" style="margin-top:8px">Recent projects:</div>
+    <ul id="recent-list" class="recent-list"><li>none</li></ul>
   </section>
 
   <section class="panel">
@@ -918,12 +1227,13 @@ footer { margin-top: 12px; color: var(--muted); font-size: 0.85rem; }
   </section>
 
   <footer>
-    Phase 17.3 goal: transport controls, keyboard routing, and status indicators are wired to realtime runtime state.
+    Phase 17.4 goal: project new/open/save/save-as/recent workflow is available in GUI with dirty confirmations.
   </footer>
 </main>
 
 <script>
 const tabs = ['song', 'chain', 'phrase', 'mixer'];
+let latestState = null;
 const keyMap = {
   Space: 'toggle_play',
   KeyT: 'toggle_play',
@@ -1014,13 +1324,79 @@ function renderMixer(view) {
   document.getElementById('mixer-body').innerHTML = body;
 }
 
+function renderRecentList(paths) {
+  const list = document.getElementById('recent-list');
+  list.innerHTML = '';
+
+  if (!paths || paths.length === 0) {
+    list.innerHTML = '<li>none</li>';
+    return;
+  }
+
+  paths.forEach((path) => {
+    const item = document.createElement('li');
+    const button = document.createElement('button');
+    button.textContent = 'Open';
+    button.onclick = () => sessionOpen(path);
+    const label = document.createElement('code');
+    label.textContent = path;
+    item.appendChild(button);
+    item.appendChild(document.createTextNode(' '));
+    item.appendChild(label);
+    list.appendChild(item);
+  });
+}
+
+function readSessionPath() {
+  return document.getElementById('session-path').value.trim();
+}
+
+function sessionNew() {
+  sendCmd('session_new');
+}
+
+function sessionOpen(pathOverride) {
+  const path = (pathOverride || readSessionPath()).trim();
+  if (!path) {
+    document.getElementById('status').textContent = 'warn: path is required for open';
+    return;
+  }
+  sendCmd('session_open', { path });
+}
+
+function sessionSave() {
+  const currentPath = latestState && latestState.session ? latestState.session.current_path : null;
+  const path = readSessionPath();
+  if (!currentPath && !path) {
+    document.getElementById('status').textContent = 'warn: no current path; use Save As';
+    return;
+  }
+
+  if (path) {
+    sendCmd('session_save', { path });
+  } else {
+    sendCmd('session_save');
+  }
+}
+
+function sessionSaveAs() {
+  const path = readSessionPath();
+  if (!path) {
+    document.getElementById('status').textContent = 'warn: path is required for save-as';
+    return;
+  }
+  sendCmd('session_save_as', { path });
+}
+
 async function refreshState() {
   try {
     const response = await fetch('/state');
     const state = await response.json();
+    latestState = state;
     const transport = state.transport;
     const cursor = state.cursor;
     const status = state.status;
+    const session = state.session;
 
     document.getElementById('tick').textContent = transport.tick;
     document.getElementById('playing').textContent = transport.playing ? 'yes' : 'no';
@@ -1036,23 +1412,46 @@ async function refreshState() {
     document.getElementById('dirty-state').textContent = status.dirty ? 'yes' : 'no';
     document.getElementById('autosave-state').textContent = status.autosave;
     document.getElementById('queue-state').textContent = `${status.queued_commands} queued / ${status.processed_commands} processed`;
+    document.getElementById('session-current').textContent = session.current_path || '-';
 
     renderSong(state.views.song);
     renderChain(state.views.chain);
     renderPhrase(state.views.phrase);
     renderMixer(state.views.mixer);
+    renderRecentList(session.recent);
     setActiveScreen(state.screen);
   } catch (error) {
     document.getElementById('status').textContent = `error: ${error}`;
   }
 }
 
-async function sendCmd(cmd) {
+async function sendCmd(cmd, options = {}) {
+  const params = new URLSearchParams();
+  params.set('cmd', cmd);
+  if (options.path) {
+    params.set('path', options.path);
+  }
+  if (options.force) {
+    params.set('force', '1');
+  }
+
   try {
-    const response = await fetch(`/action?cmd=${encodeURIComponent(cmd)}`, {
+    const response = await fetch(`/action?${params.toString()}`, {
       method: 'POST',
     });
     const body = await response.json();
+
+    if (body.confirm_required && !options.force) {
+      const message = body.status || `Confirm action '${cmd}'`;
+      const confirmed = window.confirm(`${message}\n\nContinue?`);
+      if (confirmed) {
+        await sendCmd(cmd, { ...options, force: true });
+      } else {
+        document.getElementById('status').textContent = 'warn: action cancelled';
+      }
+      return;
+    }
+
     document.getElementById('status').textContent = body.status;
     await refreshState();
     if (body.quit) {
@@ -1065,8 +1464,18 @@ async function sendCmd(cmd) {
 
 function initKeyboardRouting() {
   document.addEventListener('keydown', (event) => {
+    if ((event.ctrlKey || event.metaKey) && event.code === 'KeyS') {
+      event.preventDefault();
+      sessionSave();
+      return;
+    }
+
     const tag = event.target && event.target.tagName ? event.target.tagName : '';
     if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') {
+      return;
+    }
+
+    if (event.ctrlKey || event.metaKey || event.altKey) {
       return;
     }
 
@@ -1080,6 +1489,13 @@ function initKeyboardRouting() {
   });
 }
 
+window.addEventListener('beforeunload', (event) => {
+  if (latestState && latestState.status && latestState.status.dirty) {
+    event.preventDefault();
+    event.returnValue = '';
+  }
+});
+
 initKeyboardRouting();
 setInterval(refreshState, 250);
 refreshState();
@@ -1092,20 +1508,36 @@ refreshState();
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_gui_command, build_state_json, parse_request_line, query_value, split_path_and_query,
-        GuiSessionState,
+        apply_gui_command, build_state_json, execute_action_command, parse_request_line, query_value,
+        split_path_and_query, GuiSessionState,
     };
-    use crate::hardening::RecoveryStatus;
+    use crate::hardening::{DirtyStateTracker, RecoveryStatus};
     use crate::runtime::RuntimeCoordinator;
     use crate::ui::{UiAction, UiController};
     use p9_core::engine::Engine;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn session_state() -> GuiSessionState {
         GuiSessionState {
             recovery: RecoveryStatus::CleanStart,
             dirty: false,
             autosave_status: String::from("clean"),
+            current_project_path: None,
+            recent_project_paths: Vec::new(),
         }
+    }
+
+    fn temp_file(prefix: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        let mut path = std::env::temp_dir();
+        path.push(format!("{}_{}_{}.p9", prefix, std::process::id(), nanos));
+        path
     }
 
     #[test]
@@ -1155,6 +1587,110 @@ mod tests {
     }
 
     #[test]
+    fn session_new_requires_confirmation_when_dirty() {
+        let mut ui = UiController::default();
+        let mut engine = Engine::new("gui");
+        let mut runtime = RuntimeCoordinator::new(24);
+        let mut session = session_state();
+        let mut dirty_tracker = DirtyStateTracker::from_engine(&engine);
+        session.dirty = true;
+
+        let outcome = execute_action_command(
+            "session_new",
+            None,
+            false,
+            &mut ui,
+            &mut engine,
+            &mut runtime,
+            &mut session,
+            &mut dirty_tracker,
+        );
+
+        assert!(outcome.confirm_required);
+        assert!(outcome.status.starts_with("warn:"));
+    }
+
+    #[test]
+    fn session_save_as_and_open_roundtrip_updates_recent() {
+        let mut ui = UiController::default();
+        let mut engine = Engine::new("gui");
+        let mut runtime = RuntimeCoordinator::new(24);
+        let mut session = session_state();
+        let mut dirty_tracker = DirtyStateTracker::from_engine(&engine);
+        let path = temp_file("p9_gui_session_roundtrip");
+
+        ui.handle_action(
+            UiAction::EnsurePhrase { phrase_id: 0 },
+            &mut engine,
+            &mut runtime,
+        )
+        .unwrap();
+        ui.handle_action(
+            UiAction::EditStep {
+                phrase_id: 0,
+                step_index: 0,
+                note: Some(62),
+                velocity: 90,
+                instrument_id: None,
+            },
+            &mut engine,
+            &mut runtime,
+        )
+        .unwrap();
+        session.dirty = true;
+
+        let save_outcome = execute_action_command(
+            "session_save_as",
+            path.to_str(),
+            false,
+            &mut ui,
+            &mut engine,
+            &mut runtime,
+            &mut session,
+            &mut dirty_tracker,
+        );
+        assert!(save_outcome.status.starts_with("info:"));
+        assert!(!session.dirty);
+        assert_eq!(session.current_project_path.as_deref(), Some(path.as_path()));
+        assert_eq!(session.recent_project_paths.first().map(PathBuf::as_path), Some(path.as_path()));
+
+        let new_outcome = execute_action_command(
+            "session_new",
+            None,
+            true,
+            &mut ui,
+            &mut engine,
+            &mut runtime,
+            &mut session,
+            &mut dirty_tracker,
+        );
+        assert!(new_outcome.status.starts_with("info:"));
+        assert!(engine.snapshot().phrases.is_empty());
+
+        let open_outcome = execute_action_command(
+            "session_open",
+            path.to_str(),
+            false,
+            &mut ui,
+            &mut engine,
+            &mut runtime,
+            &mut session,
+            &mut dirty_tracker,
+        );
+        assert!(open_outcome.status.starts_with("info:"));
+        assert_eq!(
+            engine
+                .snapshot()
+                .phrases
+                .get(&0)
+                .and_then(|phrase| phrase.steps[0].note),
+            Some(62)
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn build_state_json_contains_core_fields() {
         let ui = UiController::default();
         let engine = Engine::new("gui");
@@ -1166,6 +1702,7 @@ mod tests {
         assert!(json.contains("\"screen\":\"song\""));
         assert!(json.contains("\"transport\":{"));
         assert!(json.contains("\"status\":{"));
+        assert!(json.contains("\"session\":{"));
         assert!(json.contains("\"recovery\":\"clean-start\""));
         assert!(json.contains("\"views\":{"));
         assert!(json.contains("\"song\":{"));

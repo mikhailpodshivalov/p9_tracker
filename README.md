@@ -2,7 +2,7 @@
 
 ## Status
 
-- Current stage: `Phase 17.3 transport and input layer completed`
+- Current stage: `Phase 17.4 project session workflow v1 completed`
 - Main implementation stack: `Rust`
 
 ## Phase 1 Artifacts
@@ -101,6 +101,10 @@
 ## Phase 17.3 Artifacts
 
 - `docs/phase17_3_transport_input_layer.md`
+
+## Phase 17.4 Artifacts
+
+- `docs/phase17_4_project_session_workflow.md`
 
 ## Forward Plan
 
