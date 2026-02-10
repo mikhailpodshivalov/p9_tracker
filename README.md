@@ -2,7 +2,7 @@
 
 ## Status
 
-- Current stage: `Phase 19.1a voice lifecycle/click metrics baseline completed`
+- Current stage: `Phase 19.1b voice release-transition hardening completed`
 - Main implementation stack: `Rust`
 
 ## Phase 1 Artifacts
@@ -125,6 +125,10 @@
 ## Phase 19.1a Artifacts
 
 - `docs/phase19_1a_voice_click_metrics.md`
+
+## Phase 19.1b Artifacts
+
+- `docs/phase19_1b_voice_release_transitions.md`
 
 ## Forward Plan
 

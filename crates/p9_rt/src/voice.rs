@@ -2,6 +2,8 @@ use p9_core::model::{InstrumentId, SynthWaveform};
 
 const ZERO_ATTACK_THRESHOLD_MS: u16 = 1;
 const SHORT_RELEASE_THRESHOLD_MS: u16 = 2;
+const RELEASE_BLOCK_MS: u16 = 10;
+const MAX_RELEASE_BLOCKS: u16 = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Voice {
@@ -14,6 +16,8 @@ pub struct Voice {
     pub release_ms: u16,
     pub gain: u8,
     pub started_at: u64,
+    pub is_releasing: bool,
+    pub release_pending_blocks: u16,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -25,6 +29,9 @@ pub struct VoiceLifecycleStats {
     pub zero_attack_total: u64,
     pub short_release_total: u64,
     pub click_risk_total: u64,
+    pub release_deferred_total: u64,
+    pub release_completed_total: u64,
+    pub release_pending_voices: u32,
 }
 
 pub struct VoiceAllocator {
@@ -39,6 +46,8 @@ pub struct VoiceAllocator {
     zero_attack_total: u64,
     short_release_total: u64,
     click_risk_total: u64,
+    release_deferred_total: u64,
+    release_completed_total: u64,
 }
 
 impl VoiceAllocator {
@@ -56,6 +65,8 @@ impl VoiceAllocator {
             zero_attack_total: 0,
             short_release_total: 0,
             click_risk_total: 0,
+            release_deferred_total: 0,
+            release_completed_total: 0,
         }
     }
 
@@ -87,11 +98,21 @@ impl VoiceAllocator {
             release_ms,
             gain,
             started_at: self.activation_counter,
+            is_releasing: false,
+            release_pending_blocks: 0,
         };
 
         if let Some(index) = self.find_voice_slot(track_id, note) {
             self.retrigger_total = self.retrigger_total.saturating_add(1);
-            self.click_risk_total = self.click_risk_total.saturating_add(1);
+            let retrigger_click_risk = self.slots[index]
+                .map(|existing| {
+                    existing.attack_ms <= ZERO_ATTACK_THRESHOLD_MS
+                        || existing.release_ms <= SHORT_RELEASE_THRESHOLD_MS
+                })
+                .unwrap_or(false);
+            if retrigger_click_risk {
+                self.click_risk_total = self.click_risk_total.saturating_add(1);
+            }
             self.slots[index] = Some(voice);
             return;
         }
@@ -113,15 +134,51 @@ impl VoiceAllocator {
             self.note_off_miss_total = self.note_off_miss_total.saturating_add(1);
             return false;
         };
-        if self.slots[index]
-            .map(|voice| voice.release_ms <= SHORT_RELEASE_THRESHOLD_MS)
-            .unwrap_or(false)
-        {
+        let Some(mut voice) = self.slots[index] else {
+            self.note_off_miss_total = self.note_off_miss_total.saturating_add(1);
+            return false;
+        };
+
+        if voice.release_ms <= SHORT_RELEASE_THRESHOLD_MS {
             self.short_release_total = self.short_release_total.saturating_add(1);
             self.click_risk_total = self.click_risk_total.saturating_add(1);
+            self.slots[index] = None;
+            return true;
         }
-        self.slots[index] = None;
+
+        if voice.is_releasing {
+            return true;
+        }
+
+        voice.is_releasing = true;
+        voice.release_pending_blocks = release_blocks_for_ms(voice.release_ms);
+        self.release_deferred_total = self.release_deferred_total.saturating_add(1);
+        self.slots[index] = Some(voice);
         true
+    }
+
+    pub fn advance_release_envelopes(&mut self) {
+        for slot in &mut self.slots {
+            let Some(mut voice) = *slot else {
+                continue;
+            };
+
+            if !voice.is_releasing {
+                continue;
+            }
+
+            if voice.release_pending_blocks > 0 {
+                voice.release_pending_blocks -= 1;
+            }
+
+            if voice.release_pending_blocks == 0 {
+                *slot = None;
+                self.release_completed_total = self.release_completed_total.saturating_add(1);
+                continue;
+            }
+
+            *slot = Some(voice);
+        }
     }
 
     pub fn active_voice_count(&self) -> usize {
@@ -137,6 +194,11 @@ impl VoiceAllocator {
     }
 
     pub fn lifecycle_stats(&self) -> VoiceLifecycleStats {
+        let release_pending_voices = self
+            .slots
+            .iter()
+            .filter(|slot| slot.map(|voice| voice.is_releasing).unwrap_or(false))
+            .count() as u32;
         VoiceLifecycleStats {
             note_on_total: self.note_on_total,
             note_off_total: self.note_off_total,
@@ -145,6 +207,9 @@ impl VoiceAllocator {
             zero_attack_total: self.zero_attack_total,
             short_release_total: self.short_release_total,
             click_risk_total: self.click_risk_total,
+            release_deferred_total: self.release_deferred_total,
+            release_completed_total: self.release_completed_total,
+            release_pending_voices,
         }
     }
 
@@ -170,20 +235,38 @@ impl VoiceAllocator {
     }
 }
 
+fn release_blocks_for_ms(release_ms: u16) -> u16 {
+    let blocks = (release_ms.saturating_add(RELEASE_BLOCK_MS - 1)) / RELEASE_BLOCK_MS;
+    blocks.clamp(1, MAX_RELEASE_BLOCKS)
+}
+
 #[cfg(test)]
 mod tests {
     use super::VoiceAllocator;
     use p9_core::model::SynthWaveform;
 
     #[test]
-    fn note_on_then_note_off_clears_active_voice() {
+    fn note_off_enters_release_before_voice_is_cleared() {
         let mut allocator = VoiceAllocator::new(4);
 
         allocator.note_on(0, 60, 100, Some(0), SynthWaveform::Saw, 5, 80, 90);
         assert_eq!(allocator.active_voice_count(), 1);
 
         assert!(allocator.note_off(0, 60));
+        assert_eq!(allocator.active_voice_count(), 1);
+
+        for _ in 0..7 {
+            allocator.advance_release_envelopes();
+            assert_eq!(allocator.active_voice_count(), 1);
+        }
+
+        allocator.advance_release_envelopes();
         assert_eq!(allocator.active_voice_count(), 0);
+
+        let stats = allocator.lifecycle_stats();
+        assert_eq!(stats.release_deferred_total, 1);
+        assert_eq!(stats.release_completed_total, 1);
+        assert_eq!(stats.release_pending_voices, 0);
     }
 
     #[test]
@@ -233,6 +316,9 @@ mod tests {
         assert_eq!(stats.zero_attack_total, 1);
         assert_eq!(stats.short_release_total, 1);
         assert_eq!(stats.click_risk_total, 4);
+        assert_eq!(stats.release_deferred_total, 0);
+        assert_eq!(stats.release_completed_total, 0);
+        assert_eq!(stats.release_pending_voices, 0);
         assert_eq!(allocator.voices_stolen_total(), 1);
     }
 }

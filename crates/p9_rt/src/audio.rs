@@ -20,6 +20,9 @@ pub struct AudioMetrics {
     pub voice_zero_attack_total: u64,
     pub voice_short_release_total: u64,
     pub click_risk_total: u64,
+    pub voice_release_deferred_total: u64,
+    pub voice_release_completed_total: u64,
+    pub voice_release_pending_voices: u32,
 }
 
 impl Default for AudioMetrics {
@@ -41,6 +44,9 @@ impl Default for AudioMetrics {
             voice_zero_attack_total: 0,
             voice_short_release_total: 0,
             click_risk_total: 0,
+            voice_release_deferred_total: 0,
+            voice_release_completed_total: 0,
+            voice_release_pending_voices: 0,
         }
     }
 }
@@ -183,6 +189,8 @@ impl AudioBackend for NativeAudioBackend {
             return;
         }
 
+        self.voices.advance_release_envelopes();
+
         for event in events {
             match event {
                 RenderEvent::NoteOn {
@@ -241,6 +249,9 @@ impl AudioBackend for NativeAudioBackend {
         self.metrics.voice_zero_attack_total = lifecycle.zero_attack_total;
         self.metrics.voice_short_release_total = lifecycle.short_release_total;
         self.metrics.click_risk_total = lifecycle.click_risk_total;
+        self.metrics.voice_release_deferred_total = lifecycle.release_deferred_total;
+        self.metrics.voice_release_completed_total = lifecycle.release_completed_total;
+        self.metrics.voice_release_pending_voices = lifecycle.release_pending_voices;
     }
 
     fn events_consumed(&self) -> usize {
@@ -339,6 +350,9 @@ mod tests {
         assert_eq!(metrics.voice_note_on_total, 1);
         assert_eq!(metrics.voice_note_off_total, 0);
         assert_eq!(metrics.click_risk_total, 0);
+        assert_eq!(metrics.voice_release_deferred_total, 0);
+        assert_eq!(metrics.voice_release_completed_total, 0);
+        assert_eq!(metrics.voice_release_pending_voices, 0);
     }
 
     #[test]
@@ -416,5 +430,45 @@ mod tests {
         assert_eq!(metrics.voice_zero_attack_total, 1);
         assert_eq!(metrics.voice_short_release_total, 1);
         assert_eq!(metrics.click_risk_total, 3);
+        assert_eq!(metrics.voice_release_deferred_total, 0);
+        assert_eq!(metrics.voice_release_completed_total, 0);
+        assert_eq!(metrics.voice_release_pending_voices, 0);
+    }
+
+    #[test]
+    fn deferred_release_metrics_progress_after_callbacks() {
+        let mut backend = NativeAudioBackend::new(AudioBackendConfig::default());
+        backend.start_checked().unwrap();
+
+        backend.push_events(&[RenderEvent::NoteOn {
+            track_id: 0,
+            note: 60,
+            velocity: 100,
+            instrument_id: Some(0),
+            waveform: SynthWaveform::Saw,
+            attack_ms: 5,
+            release_ms: 40,
+            gain: 100,
+        }]);
+        backend.push_events(&[RenderEvent::NoteOff {
+            track_id: 0,
+            note: 60,
+        }]);
+
+        let mid = backend.metrics();
+        assert_eq!(mid.voice_release_deferred_total, 1);
+        assert_eq!(mid.voice_release_completed_total, 0);
+        assert_eq!(mid.voice_release_pending_voices, 1);
+        assert_eq!(mid.active_voices, 1);
+
+        for _ in 0..4 {
+            backend.push_events(&[]);
+        }
+
+        let end = backend.metrics();
+        assert_eq!(end.voice_release_deferred_total, 1);
+        assert_eq!(end.voice_release_completed_total, 1);
+        assert_eq!(end.voice_release_pending_voices, 0);
+        assert_eq!(end.active_voices, 0);
     }
 }

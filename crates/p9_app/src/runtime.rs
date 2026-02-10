@@ -49,6 +49,9 @@ pub struct TickReport {
     pub audio_voice_zero_attack_total: u64,
     pub audio_voice_short_release_total: u64,
     pub audio_click_risk_total: u64,
+    pub audio_voice_release_deferred_total: u64,
+    pub audio_voice_release_completed_total: u64,
+    pub audio_voice_release_pending_voices: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -219,6 +222,9 @@ impl RuntimeCoordinator {
             audio_voice_zero_attack_total: audio_metrics.voice_zero_attack_total,
             audio_voice_short_release_total: audio_metrics.voice_short_release_total,
             audio_click_risk_total: audio_metrics.click_risk_total,
+            audio_voice_release_deferred_total: audio_metrics.voice_release_deferred_total,
+            audio_voice_release_completed_total: audio_metrics.voice_release_completed_total,
+            audio_voice_release_pending_voices: audio_metrics.voice_release_pending_voices,
         }
     }
 
@@ -540,6 +546,9 @@ mod tests {
         assert_eq!(report.audio_voice_zero_attack_total, 0);
         assert_eq!(report.audio_voice_short_release_total, 0);
         assert_eq!(report.audio_click_risk_total, 0);
+        assert_eq!(report.audio_voice_release_deferred_total, 0);
+        assert_eq!(report.audio_voice_release_completed_total, 0);
+        assert_eq!(report.audio_voice_release_pending_voices, 0);
     }
 
     #[test]
