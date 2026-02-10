@@ -55,6 +55,7 @@ pub struct TickReport {
     pub audio_voice_steal_releasing_total: u64,
     pub audio_voice_steal_active_total: u64,
     pub audio_voice_polyphony_pressure_total: u64,
+    pub audio_voice_silent_note_on_total: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -231,6 +232,7 @@ impl RuntimeCoordinator {
             audio_voice_steal_releasing_total: audio_metrics.voice_steal_releasing_total,
             audio_voice_steal_active_total: audio_metrics.voice_steal_active_total,
             audio_voice_polyphony_pressure_total: audio_metrics.voice_polyphony_pressure_total,
+            audio_voice_silent_note_on_total: audio_metrics.voice_silent_note_on_total,
         }
     }
 
@@ -558,6 +560,7 @@ mod tests {
         assert_eq!(report.audio_voice_steal_releasing_total, 0);
         assert_eq!(report.audio_voice_steal_active_total, 0);
         assert_eq!(report.audio_voice_polyphony_pressure_total, 0);
+        assert_eq!(report.audio_voice_silent_note_on_total, 0);
     }
 
     #[test]

@@ -2,7 +2,7 @@
 
 ## Status
 
-- Current stage: `Phase 19.2a instrument profile depth baseline completed`
+- Current stage: `Phase 19.2b sampler export/runtime consistency increment completed`
 - Main implementation stack: `Rust`
 
 ## Phase 1 Artifacts
@@ -137,6 +137,10 @@
 ## Phase 19.2a Artifacts
 
 - `docs/phase19_2a_instrument_profiles.md`
+
+## Phase 19.2b Artifacts
+
+- `docs/phase19_2b_sampler_export_runtime.md`
 
 ## Forward Plan
 

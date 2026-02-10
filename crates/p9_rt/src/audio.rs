@@ -26,6 +26,7 @@ pub struct AudioMetrics {
     pub voice_steal_releasing_total: u64,
     pub voice_steal_active_total: u64,
     pub voice_polyphony_pressure_total: u64,
+    pub voice_silent_note_on_total: u64,
 }
 
 impl Default for AudioMetrics {
@@ -53,6 +54,7 @@ impl Default for AudioMetrics {
             voice_steal_releasing_total: 0,
             voice_steal_active_total: 0,
             voice_polyphony_pressure_total: 0,
+            voice_silent_note_on_total: 0,
         }
     }
 }
@@ -144,6 +146,7 @@ pub struct NativeAudioBackend {
     callback_us_total: u64,
     dsp: DspPipeline,
     voices: VoiceAllocator,
+    silent_note_on_total: u64,
 }
 
 impl NativeAudioBackend {
@@ -160,6 +163,7 @@ impl NativeAudioBackend {
             callback_us_total: 0,
             dsp: DspPipeline::new(config.max_callback_us),
             voices: VoiceAllocator::new(config.max_voices),
+            silent_note_on_total: 0,
             config,
         }
     }
@@ -209,6 +213,10 @@ impl AudioBackend for NativeAudioBackend {
                     release_ms,
                     gain,
                 } => {
+                    if *gain == 0 {
+                        self.silent_note_on_total = self.silent_note_on_total.saturating_add(1);
+                        continue;
+                    }
                     self.voices.note_on(
                         *track_id,
                         *note,
@@ -261,6 +269,7 @@ impl AudioBackend for NativeAudioBackend {
         self.metrics.voice_steal_releasing_total = lifecycle.steal_releasing_total;
         self.metrics.voice_steal_active_total = lifecycle.steal_active_total;
         self.metrics.voice_polyphony_pressure_total = lifecycle.polyphony_pressure_total;
+        self.metrics.voice_silent_note_on_total = self.silent_note_on_total;
     }
 
     fn events_consumed(&self) -> usize {
@@ -365,6 +374,7 @@ mod tests {
         assert_eq!(metrics.voice_steal_releasing_total, 0);
         assert_eq!(metrics.voice_steal_active_total, 0);
         assert_eq!(metrics.voice_polyphony_pressure_total, 0);
+        assert_eq!(metrics.voice_silent_note_on_total, 0);
     }
 
     #[test]
@@ -401,6 +411,7 @@ mod tests {
         assert_eq!(metrics.voice_steal_releasing_total, 0);
         assert_eq!(metrics.voice_steal_active_total, 1);
         assert_eq!(metrics.voice_polyphony_pressure_total, 1);
+        assert_eq!(metrics.voice_silent_note_on_total, 0);
     }
 
     #[test]
@@ -451,6 +462,7 @@ mod tests {
         assert_eq!(metrics.voice_steal_releasing_total, 0);
         assert_eq!(metrics.voice_steal_active_total, 0);
         assert_eq!(metrics.voice_polyphony_pressure_total, 0);
+        assert_eq!(metrics.voice_silent_note_on_total, 0);
     }
 
     #[test]
@@ -491,6 +503,7 @@ mod tests {
         assert_eq!(end.voice_steal_releasing_total, 0);
         assert_eq!(end.voice_steal_active_total, 0);
         assert_eq!(end.voice_polyphony_pressure_total, 0);
+        assert_eq!(end.voice_silent_note_on_total, 0);
     }
 
     #[test]
@@ -516,5 +529,28 @@ mod tests {
         assert_eq!(metrics.voice_steal_active_total, 1);
         assert_eq!(metrics.voice_polyphony_pressure_total, 2);
         assert_eq!(metrics.click_risk_total, 1);
+        assert_eq!(metrics.voice_silent_note_on_total, 0);
+    }
+
+    #[test]
+    fn zero_gain_note_on_is_counted_without_allocating_voice() {
+        let mut backend = NativeAudioBackend::new(AudioBackendConfig::default());
+        backend.start_checked().unwrap();
+
+        backend.push_events(&[RenderEvent::NoteOn {
+            track_id: 0,
+            note: 60,
+            velocity: 100,
+            instrument_id: Some(0),
+            waveform: SynthWaveform::Saw,
+            attack_ms: 1,
+            release_ms: 24,
+            gain: 0,
+        }]);
+
+        let metrics = backend.metrics();
+        assert_eq!(metrics.voice_silent_note_on_total, 1);
+        assert_eq!(metrics.voice_note_on_total, 0);
+        assert_eq!(metrics.active_voices, 0);
     }
 }

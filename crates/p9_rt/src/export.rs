@@ -54,9 +54,21 @@ struct ActiveVoice {
     track_id: u8,
     note: u8,
     waveform: SynthWaveform,
+    mode: VoiceRenderMode,
     phase: f32,
     phase_inc: f32,
     amplitude: f32,
+    elapsed_samples: u32,
+    attack_samples: u32,
+    release_samples: u32,
+    release_progress_samples: u32,
+    releasing: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VoiceRenderMode {
+    Standard,
+    SamplerV1,
 }
 
 pub fn render_project_to_wav(
@@ -130,63 +142,151 @@ fn apply_event(voices: &mut Vec<ActiveVoice>, event: &RenderEvent, sample_rate_h
             note,
             velocity,
             waveform,
+            attack_ms,
+            release_ms,
             gain,
             ..
         } => {
             voices.retain(|voice| !(voice.track_id == *track_id && voice.note == *note));
 
+            if *gain == 0 {
+                return;
+            }
+
             let freq_hz = 440.0 * 2.0_f32.powf((*note as f32 - 69.0) / 12.0);
             let phase_inc = TAU * (freq_hz / sample_rate_hz.max(1.0));
             let velocity_gain = *velocity as f32 / 127.0;
             let instrument_gain = *gain as f32 / 127.0;
+            let mode = if *attack_ms <= 1 && *release_ms >= 24 {
+                VoiceRenderMode::SamplerV1
+            } else {
+                VoiceRenderMode::Standard
+            };
+            let mode_gain = match mode {
+                VoiceRenderMode::Standard => 0.22,
+                VoiceRenderMode::SamplerV1 => 0.28,
+            };
 
             voices.push(ActiveVoice {
                 track_id: *track_id,
                 note: *note,
                 waveform: *waveform,
+                mode,
                 phase: 0.0,
                 phase_inc,
-                amplitude: (velocity_gain * instrument_gain * 0.22).clamp(0.0, 1.0),
+                amplitude: (velocity_gain * instrument_gain * mode_gain).clamp(0.0, 1.0),
+                elapsed_samples: 0,
+                attack_samples: ms_to_samples(*attack_ms, sample_rate_hz),
+                release_samples: ms_to_samples(*release_ms, sample_rate_hz),
+                release_progress_samples: 0,
+                releasing: false,
             });
         }
         RenderEvent::NoteOff { track_id, note } => {
-            voices.retain(|voice| !(voice.track_id == *track_id && voice.note == *note));
+            for voice in voices.iter_mut() {
+                if voice.track_id == *track_id && voice.note == *note {
+                    voice.releasing = true;
+                    voice.release_progress_samples = 0;
+                }
+            }
         }
     }
 }
 
-fn synthesize_sample(voices: &mut [ActiveVoice]) -> f32 {
+fn synthesize_sample(voices: &mut Vec<ActiveVoice>) -> f32 {
     if voices.is_empty() {
         return 0.0;
     }
 
     let mut mixed = 0.0f32;
 
-    for voice in voices {
-        let osc = match voice.waveform {
-            SynthWaveform::Sine => voice.phase.sin(),
-            SynthWaveform::Square => {
-                if voice.phase.sin() >= 0.0 {
-                    1.0
-                } else {
-                    -1.0
-                }
-            }
-            SynthWaveform::Saw => (voice.phase / PI) - 1.0,
-            SynthWaveform::Triangle => {
-                let normalized = voice.phase / TAU;
-                2.0 * (2.0 * (normalized - (normalized + 0.5).floor())).abs() - 1.0
-            }
-        };
-
-        mixed += osc * voice.amplitude;
+    for voice in voices.iter_mut() {
+        let osc = oscillator_sample(voice);
+        let env = envelope_sample(voice);
+        mixed += osc * voice.amplitude * env;
         voice.phase += voice.phase_inc;
         if voice.phase >= TAU {
             voice.phase -= TAU;
         }
+        voice.elapsed_samples = voice.elapsed_samples.saturating_add(1);
+        if voice.releasing && voice.release_samples > 0 {
+            voice.release_progress_samples = voice.release_progress_samples.saturating_add(1);
+        }
     }
 
+    voices.retain(|voice| {
+        if !voice.releasing {
+            return true;
+        }
+
+        if voice.release_samples == 0 {
+            return false;
+        }
+
+        voice.release_progress_samples < voice.release_samples
+    });
+
     mixed
+}
+
+fn oscillator_sample(voice: &ActiveVoice) -> f32 {
+    match voice.mode {
+        VoiceRenderMode::Standard => waveform_sample(voice.waveform, voice.phase),
+        VoiceRenderMode::SamplerV1 => {
+            let base = waveform_sample(voice.waveform, voice.phase);
+            let sine = voice.phase.sin();
+            let body = (base * 0.65) + (sine * 0.35);
+            let transient_window = (1.0 - (voice.elapsed_samples as f32 / 96.0)).clamp(0.0, 1.0);
+            let transient = transient_window * ((voice.phase * 2.0).sin().abs() * 2.0 - 1.0);
+            (body + transient * 0.25).clamp(-1.0, 1.0)
+        }
+    }
+}
+
+fn waveform_sample(waveform: SynthWaveform, phase: f32) -> f32 {
+    match waveform {
+        SynthWaveform::Sine => phase.sin(),
+        SynthWaveform::Square => {
+            if phase.sin() >= 0.0 {
+                1.0
+            } else {
+                -1.0
+            }
+        }
+        SynthWaveform::Saw => (phase / PI) - 1.0,
+        SynthWaveform::Triangle => {
+            let normalized = phase / TAU;
+            2.0 * (2.0 * (normalized - (normalized + 0.5).floor())).abs() - 1.0
+        }
+    }
+}
+
+fn envelope_sample(voice: &ActiveVoice) -> f32 {
+    let attack_env = if voice.attack_samples == 0 {
+        1.0
+    } else {
+        (voice.elapsed_samples as f32 / voice.attack_samples as f32).clamp(0.0, 1.0)
+    };
+
+    let release_env = if !voice.releasing {
+        1.0
+    } else if voice.release_samples == 0 {
+        0.0
+    } else {
+        (1.0 - (voice.release_progress_samples as f32 / voice.release_samples as f32))
+            .clamp(0.0, 1.0)
+    };
+
+    attack_env * release_env
+}
+
+fn ms_to_samples(ms: u16, sample_rate_hz: f32) -> u32 {
+    if ms == 0 {
+        return 0;
+    }
+
+    let samples = ((ms as f32 / 1000.0) * sample_rate_hz).round();
+    samples.max(1.0) as u32
 }
 
 fn write_wav_mono_i16(path: &Path, sample_rate_hz: u32, samples: &[i16]) -> Result<(), ExportError> {
@@ -227,7 +327,7 @@ fn write_wav_mono_i16(path: &Path, sample_rate_hz: u32, samples: &[i16]) -> Resu
 mod tests {
     use super::{render_project_to_wav, OfflineRenderConfig};
     use p9_core::engine::{Engine, EngineCommand};
-    use p9_core::model::{Chain, Phrase};
+    use p9_core::model::{Chain, Instrument, InstrumentType, Phrase};
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -320,5 +420,109 @@ mod tests {
 
         let _ = fs::remove_file(left_path);
         let _ = fs::remove_file(right_path);
+    }
+
+    #[test]
+    fn render_project_to_wav_midiout_profile_is_silent() {
+        let mut engine = setup_engine();
+        let instrument = Instrument::new(0, InstrumentType::MidiOut, "MIDI Out");
+        engine
+            .apply_command(EngineCommand::UpsertInstrument { instrument })
+            .unwrap();
+        for (step, note, velocity) in [(0usize, Some(60u8), 100u8), (4usize, Some(64u8), 100u8)] {
+            engine
+                .apply_command(EngineCommand::SetPhraseStep {
+                    phrase_id: 0,
+                    step_index: step,
+                    note,
+                    velocity,
+                    instrument_id: Some(0),
+                })
+                .unwrap();
+        }
+
+        let output = temp_file("p9_export_midiout_silent");
+        let report = render_project_to_wav(
+            &engine,
+            &output,
+            OfflineRenderConfig {
+                ticks: 48,
+                ..OfflineRenderConfig::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(report.peak_abs_sample, 0);
+        let _ = fs::remove_file(output);
+    }
+
+    #[test]
+    fn render_project_sampler_profile_differs_from_synth_profile() {
+        let mut synth_engine = setup_engine();
+        let synth = Instrument::new(0, InstrumentType::Synth, "Synth");
+        synth_engine
+            .apply_command(EngineCommand::UpsertInstrument { instrument: synth })
+            .unwrap();
+        synth_engine
+            .apply_command(EngineCommand::SetPhraseStep {
+                phrase_id: 0,
+                step_index: 0,
+                note: Some(60),
+                velocity: 100,
+                instrument_id: Some(0),
+            })
+            .unwrap();
+        synth_engine
+            .apply_command(EngineCommand::SetPhraseStep {
+                phrase_id: 0,
+                step_index: 4,
+                note: None,
+                velocity: 100,
+                instrument_id: Some(0),
+            })
+            .unwrap();
+
+        let mut sampler_engine = setup_engine();
+        let sampler = Instrument::new(0, InstrumentType::Sampler, "Sampler");
+        sampler_engine
+            .apply_command(EngineCommand::UpsertInstrument { instrument: sampler })
+            .unwrap();
+        sampler_engine
+            .apply_command(EngineCommand::SetPhraseStep {
+                phrase_id: 0,
+                step_index: 0,
+                note: Some(60),
+                velocity: 100,
+                instrument_id: Some(0),
+            })
+            .unwrap();
+        sampler_engine
+            .apply_command(EngineCommand::SetPhraseStep {
+                phrase_id: 0,
+                step_index: 4,
+                note: None,
+                velocity: 100,
+                instrument_id: Some(0),
+            })
+            .unwrap();
+
+        let synth_path = temp_file("p9_export_synth_profile");
+        let sampler_path = temp_file("p9_export_sampler_profile");
+        let cfg = OfflineRenderConfig {
+            ticks: 48,
+            ..OfflineRenderConfig::default()
+        };
+
+        let synth_report = render_project_to_wav(&synth_engine, &synth_path, cfg).unwrap();
+        let sampler_report = render_project_to_wav(&sampler_engine, &sampler_path, cfg).unwrap();
+        let synth_bytes = fs::read(&synth_path).unwrap();
+        let sampler_bytes = fs::read(&sampler_path).unwrap();
+
+        assert!(synth_report.peak_abs_sample > 0);
+        assert!(sampler_report.peak_abs_sample > 0);
+        assert_ne!(synth_bytes, sampler_bytes);
+
+        let _ = fs::remove_file(synth_path);
+        let _ = fs::remove_file(sampler_path);
     }
 }
