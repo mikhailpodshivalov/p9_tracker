@@ -1,8 +1,8 @@
 use crate::engine::Engine;
 use crate::events::RenderEvent;
 use crate::model::{
-    ChainId, FxCommand, InstrumentId, ProjectData, Scale, SynthParams, PHRASE_STEP_COUNT,
-    SONG_ROW_COUNT, TRACK_COUNT,
+    ChainId, FxCommand, InstrumentId, InstrumentType, ProjectData, Scale, SynthParams,
+    PHRASE_STEP_COUNT, SONG_ROW_COUNT, TRACK_COUNT,
 };
 
 #[derive(Clone, Debug, Default)]
@@ -21,6 +21,12 @@ struct StepPlaybackData {
     note: u8,
     velocity: u8,
     instrument_id: Option<InstrumentId>,
+    note_length_steps: u8,
+    synth_params: SynthParams,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct InstrumentPlaybackProfile {
     note_length_steps: u8,
     synth_params: SynthParams,
 }
@@ -212,8 +218,9 @@ impl Scheduler {
         let base_note = step.note.map(|raw_note| Self::apply_transpose(raw_note, chain_row.transpose))?;
         let mut note_i16 = base_note as i16;
         let mut velocity = step.velocity;
-        let mut note_length_steps = self.resolve_note_length_steps(project, step.instrument_id);
-        let synth_params = self.resolve_synth_params(project, step.instrument_id);
+        let profile = self.resolve_instrument_profile(project, step.instrument_id);
+        let mut note_length_steps = profile.note_length_steps;
+        let synth_params = profile.synth_params;
 
         let (fx_note, fx_velocity, fx_length) = Self::apply_fx_commands(
             note_i16,
@@ -253,26 +260,45 @@ impl Scheduler {
         })
     }
 
-    fn resolve_note_length_steps(
+    fn resolve_instrument_profile(
         &self,
         project: &ProjectData,
         instrument_id: Option<InstrumentId>,
-    ) -> u8 {
-        instrument_id
-            .and_then(|id| project.instruments.get(&id))
-            .map(|inst| inst.note_length_steps.max(1))
-            .unwrap_or(1)
-    }
+    ) -> InstrumentPlaybackProfile {
+        let Some(instrument) = instrument_id.and_then(|id| project.instruments.get(&id)) else {
+            return InstrumentPlaybackProfile {
+                note_length_steps: 1,
+                synth_params: SynthParams::default(),
+            };
+        };
 
-    fn resolve_synth_params(
-        &self,
-        project: &ProjectData,
-        instrument_id: Option<InstrumentId>,
-    ) -> SynthParams {
-        instrument_id
-            .and_then(|id| project.instruments.get(&id))
-            .map(|inst| inst.synth_params)
-            .unwrap_or_default()
+        let mut note_length_steps = instrument.note_length_steps.max(1);
+        let mut synth_params = instrument.synth_params;
+
+        match instrument.instrument_type {
+            InstrumentType::Synth => {}
+            InstrumentType::Sampler => {
+                // Sampler-like behavior: tighter onset and longer tails by default.
+                synth_params.attack_ms = synth_params.attack_ms.min(1);
+                synth_params.release_ms = synth_params.release_ms.max(24);
+                note_length_steps = note_length_steps.max(2);
+            }
+            InstrumentType::MidiOut | InstrumentType::External => {
+                // External destinations should not produce duplicated internal voice output.
+                synth_params.gain = 0;
+                synth_params.attack_ms = synth_params.attack_ms.min(1);
+                synth_params.release_ms = synth_params.release_ms.min(16);
+            }
+            InstrumentType::None => {
+                note_length_steps = 1;
+                synth_params = SynthParams::default();
+            }
+        }
+
+        InstrumentPlaybackProfile {
+            note_length_steps,
+            synth_params,
+        }
     }
 
     fn resolve_table_row<'a>(
@@ -931,6 +957,116 @@ mod tests {
         assert_eq!(count_note_off(&t3), 0);
         assert_eq!(count_note_off(&t4), 0);
         assert_eq!(count_note_off(&t5), 1);
+    }
+
+    #[test]
+    fn sampler_profile_shapes_envelope_and_note_length() {
+        let mut engine = setup_engine();
+
+        let mut sampler = Instrument::new(0, InstrumentType::Sampler, "Sampler");
+        sampler.note_length_steps = 1;
+        sampler.synth_params.attack_ms = 9;
+        sampler.synth_params.release_ms = 8;
+        sampler.synth_params.gain = 96;
+        engine
+            .apply_command(EngineCommand::UpsertInstrument { instrument: sampler })
+            .unwrap();
+
+        engine
+            .apply_command(EngineCommand::SetPhraseStep {
+                phrase_id: 0,
+                step_index: 0,
+                note: Some(60),
+                velocity: 100,
+                instrument_id: Some(0),
+            })
+            .unwrap();
+        engine
+            .apply_command(EngineCommand::SetPhraseStep {
+                phrase_id: 0,
+                step_index: 1,
+                note: None,
+                velocity: 80,
+                instrument_id: Some(0),
+            })
+            .unwrap();
+        engine
+            .apply_command(EngineCommand::SetPhraseStep {
+                phrase_id: 0,
+                step_index: 2,
+                note: None,
+                velocity: 80,
+                instrument_id: Some(0),
+            })
+            .unwrap();
+
+        let mut scheduler = Scheduler::new(4);
+        let t1 = scheduler.tick(&engine);
+        let t2 = scheduler.tick(&engine);
+        let t3 = scheduler.tick(&engine);
+
+        let note_on = t1
+            .iter()
+            .find_map(|event| match event {
+                RenderEvent::NoteOn {
+                    attack_ms,
+                    release_ms,
+                    gain,
+                    ..
+                } => Some((*attack_ms, *release_ms, *gain)),
+                _ => None,
+            })
+            .expect("expected sampler note on");
+
+        assert_eq!(note_on.0, 1);
+        assert_eq!(note_on.1, 24);
+        assert_eq!(note_on.2, 96);
+        assert_eq!(count_note_off(&t2), 0);
+        assert_eq!(count_note_off(&t3), 1);
+    }
+
+    #[test]
+    fn midiout_profile_mutes_internal_gain() {
+        let mut engine = setup_engine();
+
+        let mut midi_out = Instrument::new(0, InstrumentType::MidiOut, "MIDI Out");
+        midi_out.synth_params.attack_ms = 12;
+        midi_out.synth_params.release_ms = 48;
+        midi_out.synth_params.gain = 100;
+        engine
+            .apply_command(EngineCommand::UpsertInstrument {
+                instrument: midi_out,
+            })
+            .unwrap();
+
+        engine
+            .apply_command(EngineCommand::SetPhraseStep {
+                phrase_id: 0,
+                step_index: 0,
+                note: Some(60),
+                velocity: 100,
+                instrument_id: Some(0),
+            })
+            .unwrap();
+
+        let mut scheduler = Scheduler::new(4);
+        let events = scheduler.tick(&engine);
+        let note_on = events
+            .iter()
+            .find_map(|event| match event {
+                RenderEvent::NoteOn {
+                    attack_ms,
+                    release_ms,
+                    gain,
+                    ..
+                } => Some((*attack_ms, *release_ms, *gain)),
+                _ => None,
+            })
+            .expect("expected midi out note on");
+
+        assert_eq!(note_on.0, 1);
+        assert_eq!(note_on.1, 16);
+        assert_eq!(note_on.2, 0);
     }
 
     fn count_note_on(events: &[RenderEvent]) -> usize {

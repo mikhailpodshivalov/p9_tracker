@@ -2,7 +2,7 @@
 
 ## Status
 
-- Current stage: `Phase 19.1c polyphony pressure steal-policy hardening completed`
+- Current stage: `Phase 19.2a instrument profile depth baseline completed`
 - Main implementation stack: `Rust`
 
 ## Phase 1 Artifacts
@@ -133,6 +133,10 @@
 ## Phase 19.1c Artifacts
 
 - `docs/phase19_1c_voice_steal_policy.md`
+
+## Phase 19.2a Artifacts
+
+- `docs/phase19_2a_instrument_profiles.md`
 
 ## Forward Plan
 
