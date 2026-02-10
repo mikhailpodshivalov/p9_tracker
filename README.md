@@ -2,7 +2,7 @@
 
 ## Status
 
-- Current stage: `Phase 19.1b voice release-transition hardening completed`
+- Current stage: `Phase 19.1c polyphony pressure steal-policy hardening completed`
 - Main implementation stack: `Rust`
 
 ## Phase 1 Artifacts
@@ -129,6 +129,10 @@
 ## Phase 19.1b Artifacts
 
 - `docs/phase19_1b_voice_release_transitions.md`
+
+## Phase 19.1c Artifacts
+
+- `docs/phase19_1c_voice_steal_policy.md`
 
 ## Forward Plan
 

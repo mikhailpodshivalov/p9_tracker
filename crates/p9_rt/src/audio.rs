@@ -23,6 +23,9 @@ pub struct AudioMetrics {
     pub voice_release_deferred_total: u64,
     pub voice_release_completed_total: u64,
     pub voice_release_pending_voices: u32,
+    pub voice_steal_releasing_total: u64,
+    pub voice_steal_active_total: u64,
+    pub voice_polyphony_pressure_total: u64,
 }
 
 impl Default for AudioMetrics {
@@ -47,6 +50,9 @@ impl Default for AudioMetrics {
             voice_release_deferred_total: 0,
             voice_release_completed_total: 0,
             voice_release_pending_voices: 0,
+            voice_steal_releasing_total: 0,
+            voice_steal_active_total: 0,
+            voice_polyphony_pressure_total: 0,
         }
     }
 }
@@ -252,6 +258,9 @@ impl AudioBackend for NativeAudioBackend {
         self.metrics.voice_release_deferred_total = lifecycle.release_deferred_total;
         self.metrics.voice_release_completed_total = lifecycle.release_completed_total;
         self.metrics.voice_release_pending_voices = lifecycle.release_pending_voices;
+        self.metrics.voice_steal_releasing_total = lifecycle.steal_releasing_total;
+        self.metrics.voice_steal_active_total = lifecycle.steal_active_total;
+        self.metrics.voice_polyphony_pressure_total = lifecycle.polyphony_pressure_total;
     }
 
     fn events_consumed(&self) -> usize {
@@ -353,6 +362,9 @@ mod tests {
         assert_eq!(metrics.voice_release_deferred_total, 0);
         assert_eq!(metrics.voice_release_completed_total, 0);
         assert_eq!(metrics.voice_release_pending_voices, 0);
+        assert_eq!(metrics.voice_steal_releasing_total, 0);
+        assert_eq!(metrics.voice_steal_active_total, 0);
+        assert_eq!(metrics.voice_polyphony_pressure_total, 0);
     }
 
     #[test]
@@ -386,6 +398,9 @@ mod tests {
         assert_eq!(metrics.click_risk_total, 1);
         assert_eq!(metrics.voice_note_on_total, 3);
         assert_eq!(metrics.voice_retrigger_total, 0);
+        assert_eq!(metrics.voice_steal_releasing_total, 0);
+        assert_eq!(metrics.voice_steal_active_total, 1);
+        assert_eq!(metrics.voice_polyphony_pressure_total, 1);
     }
 
     #[test]
@@ -433,6 +448,9 @@ mod tests {
         assert_eq!(metrics.voice_release_deferred_total, 0);
         assert_eq!(metrics.voice_release_completed_total, 0);
         assert_eq!(metrics.voice_release_pending_voices, 0);
+        assert_eq!(metrics.voice_steal_releasing_total, 0);
+        assert_eq!(metrics.voice_steal_active_total, 0);
+        assert_eq!(metrics.voice_polyphony_pressure_total, 0);
     }
 
     #[test]
@@ -470,5 +488,33 @@ mod tests {
         assert_eq!(end.voice_release_completed_total, 1);
         assert_eq!(end.voice_release_pending_voices, 0);
         assert_eq!(end.active_voices, 0);
+        assert_eq!(end.voice_steal_releasing_total, 0);
+        assert_eq!(end.voice_steal_active_total, 0);
+        assert_eq!(end.voice_polyphony_pressure_total, 0);
+    }
+
+    #[test]
+    fn stress_burst_prefers_releasing_steals_before_active_steals() {
+        let mut backend = NativeAudioBackend::new(AudioBackendConfig {
+            max_voices: 2,
+            ..AudioBackendConfig::default()
+        });
+        backend.start_checked().unwrap();
+
+        backend.push_events(&[note_on(0, 60)]);
+        backend.push_events(&[note_on(0, 62)]);
+        backend.push_events(&[RenderEvent::NoteOff {
+            track_id: 0,
+            note: 60,
+        }]);
+        backend.push_events(&[note_on(0, 64)]);
+        backend.push_events(&[note_on(0, 65)]);
+
+        let metrics = backend.metrics();
+        assert_eq!(metrics.voices_stolen_total, 2);
+        assert_eq!(metrics.voice_steal_releasing_total, 1);
+        assert_eq!(metrics.voice_steal_active_total, 1);
+        assert_eq!(metrics.voice_polyphony_pressure_total, 2);
+        assert_eq!(metrics.click_risk_total, 1);
     }
 }

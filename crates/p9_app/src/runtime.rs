@@ -52,6 +52,9 @@ pub struct TickReport {
     pub audio_voice_release_deferred_total: u64,
     pub audio_voice_release_completed_total: u64,
     pub audio_voice_release_pending_voices: u32,
+    pub audio_voice_steal_releasing_total: u64,
+    pub audio_voice_steal_active_total: u64,
+    pub audio_voice_polyphony_pressure_total: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -225,6 +228,9 @@ impl RuntimeCoordinator {
             audio_voice_release_deferred_total: audio_metrics.voice_release_deferred_total,
             audio_voice_release_completed_total: audio_metrics.voice_release_completed_total,
             audio_voice_release_pending_voices: audio_metrics.voice_release_pending_voices,
+            audio_voice_steal_releasing_total: audio_metrics.voice_steal_releasing_total,
+            audio_voice_steal_active_total: audio_metrics.voice_steal_active_total,
+            audio_voice_polyphony_pressure_total: audio_metrics.voice_polyphony_pressure_total,
         }
     }
 
@@ -549,6 +555,9 @@ mod tests {
         assert_eq!(report.audio_voice_release_deferred_total, 0);
         assert_eq!(report.audio_voice_release_completed_total, 0);
         assert_eq!(report.audio_voice_release_pending_voices, 0);
+        assert_eq!(report.audio_voice_steal_releasing_total, 0);
+        assert_eq!(report.audio_voice_steal_active_total, 0);
+        assert_eq!(report.audio_voice_polyphony_pressure_total, 0);
     }
 
     #[test]

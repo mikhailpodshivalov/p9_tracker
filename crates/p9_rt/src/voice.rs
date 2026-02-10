@@ -32,6 +32,9 @@ pub struct VoiceLifecycleStats {
     pub release_deferred_total: u64,
     pub release_completed_total: u64,
     pub release_pending_voices: u32,
+    pub steal_releasing_total: u64,
+    pub steal_active_total: u64,
+    pub polyphony_pressure_total: u64,
 }
 
 pub struct VoiceAllocator {
@@ -48,6 +51,9 @@ pub struct VoiceAllocator {
     click_risk_total: u64,
     release_deferred_total: u64,
     release_completed_total: u64,
+    steal_releasing_total: u64,
+    steal_active_total: u64,
+    polyphony_pressure_total: u64,
 }
 
 impl VoiceAllocator {
@@ -67,6 +73,9 @@ impl VoiceAllocator {
             click_risk_total: 0,
             release_deferred_total: 0,
             release_completed_total: 0,
+            steal_releasing_total: 0,
+            steal_active_total: 0,
+            polyphony_pressure_total: 0,
         }
     }
 
@@ -122,10 +131,16 @@ impl VoiceAllocator {
             return;
         }
 
-        let oldest = self.oldest_voice_index();
-        self.slots[oldest] = Some(voice);
+        self.polyphony_pressure_total = self.polyphony_pressure_total.saturating_add(1);
+        let (steal_index, stole_releasing) = self.steal_candidate_index();
+        self.slots[steal_index] = Some(voice);
         self.voices_stolen_total = self.voices_stolen_total.saturating_add(1);
-        self.click_risk_total = self.click_risk_total.saturating_add(1);
+        if stole_releasing {
+            self.steal_releasing_total = self.steal_releasing_total.saturating_add(1);
+        } else {
+            self.steal_active_total = self.steal_active_total.saturating_add(1);
+            self.click_risk_total = self.click_risk_total.saturating_add(1);
+        }
     }
 
     pub fn note_off(&mut self, track_id: u8, note: u8) -> bool {
@@ -210,6 +225,9 @@ impl VoiceAllocator {
             release_deferred_total: self.release_deferred_total,
             release_completed_total: self.release_completed_total,
             release_pending_voices,
+            steal_releasing_total: self.steal_releasing_total,
+            steal_active_total: self.steal_active_total,
+            polyphony_pressure_total: self.polyphony_pressure_total,
         }
     }
 
@@ -232,6 +250,30 @@ impl VoiceAllocator {
             .min_by_key(|(_, started_at)| *started_at)
             .map(|(index, _)| index)
             .unwrap_or(0)
+    }
+
+    fn steal_candidate_index(&self) -> (usize, bool) {
+        let releasing = self
+            .slots
+            .iter()
+            .enumerate()
+            .filter_map(|(index, slot)| {
+                slot.and_then(|voice| {
+                    if voice.is_releasing {
+                        Some((index, voice.release_pending_blocks, voice.started_at))
+                    } else {
+                        None
+                    }
+                })
+            })
+            .min_by_key(|(_, pending_blocks, started_at)| (*pending_blocks, *started_at))
+            .map(|(index, _, _)| index);
+
+        if let Some(index) = releasing {
+            return (index, true);
+        }
+
+        (self.oldest_voice_index(), false)
     }
 }
 
@@ -282,6 +324,10 @@ mod tests {
         assert_eq!(allocator.voices_stolen_total(), 1);
         assert!(!allocator.note_off(0, 60)); // oldest was stolen
         assert!(allocator.note_off(0, 62) || allocator.note_off(0, 64));
+        let stats = allocator.lifecycle_stats();
+        assert_eq!(stats.steal_active_total, 1);
+        assert_eq!(stats.steal_releasing_total, 0);
+        assert_eq!(stats.polyphony_pressure_total, 1);
     }
 
     #[test]
@@ -319,6 +365,30 @@ mod tests {
         assert_eq!(stats.release_deferred_total, 0);
         assert_eq!(stats.release_completed_total, 0);
         assert_eq!(stats.release_pending_voices, 0);
+        assert_eq!(stats.steal_releasing_total, 0);
+        assert_eq!(stats.steal_active_total, 1);
+        assert_eq!(stats.polyphony_pressure_total, 1);
         assert_eq!(allocator.voices_stolen_total(), 1);
+    }
+
+    #[test]
+    fn stealing_prefers_releasing_voice_under_polyphony_pressure() {
+        let mut allocator = VoiceAllocator::new(2);
+
+        allocator.note_on(0, 60, 100, Some(0), SynthWaveform::Saw, 5, 80, 90);
+        allocator.note_on(0, 62, 100, Some(0), SynthWaveform::Saw, 5, 80, 90);
+        assert!(allocator.note_off(0, 60));
+        allocator.note_on(0, 64, 100, Some(0), SynthWaveform::Saw, 5, 80, 90);
+
+        assert_eq!(allocator.active_voice_count(), 2);
+        assert!(!allocator.note_off(0, 60));
+        assert!(allocator.note_off(0, 62));
+        assert!(allocator.note_off(0, 64));
+
+        let stats = allocator.lifecycle_stats();
+        assert_eq!(stats.steal_releasing_total, 1);
+        assert_eq!(stats.steal_active_total, 0);
+        assert_eq!(stats.polyphony_pressure_total, 1);
+        assert_eq!(stats.click_risk_total, 0);
     }
 }
