@@ -1,8 +1,14 @@
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::Path;
 use std::time::Duration;
 
-use crate::runtime::RuntimeCoordinator;
+use crate::hardening::{
+    clear_dirty_session_flag, default_autosave_path, default_dirty_flag_path,
+    mark_dirty_session_flag, recover_from_dirty_session, AutosaveManager, AutosavePolicy,
+    DirtyStateTracker, RecoveryStatus,
+};
+use crate::runtime::{RuntimeCommand, RuntimeCoordinator};
 use crate::ui::{UiAction, UiController, UiError, UiScreen, UiSnapshot};
 use p9_core::engine::Engine;
 use p9_core::model::{ProjectData, Step, CHAIN_ROW_COUNT, PHRASE_STEP_COUNT, SONG_ROW_COUNT};
@@ -17,6 +23,7 @@ const BIND_ADDR_CANDIDATES: [&str; 5] = [
     "127.0.0.1:17721",
 ];
 const TICK_SLEEP_MS: u64 = 16;
+const GUI_AUTOSAVE_INTERVAL_TICKS: u64 = 16;
 const SONG_VIEW_ROWS: usize = 8;
 const CHAIN_VIEW_ROWS: usize = 8;
 
@@ -26,16 +33,48 @@ enum LoopControl {
     Quit,
 }
 
+#[derive(Clone, Debug)]
+struct GuiSessionState {
+    recovery: RecoveryStatus,
+    dirty: bool,
+    autosave_status: String,
+}
+
+#[derive(Clone, Debug)]
+struct SessionHardeningState {
+    dirty: bool,
+    autosave_status: String,
+}
+
+impl GuiSessionState {
+    fn new(recovery: RecoveryStatus) -> Self {
+        Self {
+            recovery,
+            dirty: false,
+            autosave_status: String::from("unknown"),
+        }
+    }
+}
+
 pub fn run_web_shell(
     ui: &mut UiController,
     engine: &mut Engine,
     runtime: &mut RuntimeCoordinator,
 ) -> io::Result<()> {
+    let autosave_path = default_autosave_path();
+    let dirty_flag_path = default_dirty_flag_path();
+    let recovery = recover_from_dirty_session(engine, &autosave_path, &dirty_flag_path);
+    let mut dirty_tracker = DirtyStateTracker::from_engine(engine);
+    let mut autosave = AutosaveManager::new(AutosavePolicy {
+        interval_ticks: GUI_AUTOSAVE_INTERVAL_TICKS,
+    });
+    let mut session_state = GuiSessionState::new(recovery);
+
     let listener = bind_listener()?;
     listener.set_nonblocking(true)?;
 
     println!(
-        "p9_tracker gui-shell stage17.2 running at http://{}",
+        "p9_tracker gui-shell stage17.3 running at http://{}",
         listener.local_addr()?
     );
     println!("Open this URL in browser. Press Ctrl+C or click Quit GUI Shell to stop.");
@@ -43,11 +82,23 @@ pub fn run_web_shell(
     let mut audio = NoopAudioBackend::default();
     audio.start();
     let mut midi_output = NoopMidiOutput::default();
+    let hardening = update_session_hardening(
+        engine,
+        runtime,
+        &mut dirty_tracker,
+        &mut autosave,
+        &autosave_path,
+        &dirty_flag_path,
+    );
+    session_state.dirty = hardening.dirty;
+    session_state.autosave_status = hardening.autosave_status;
 
     loop {
         match listener.accept() {
             Ok((mut stream, _)) => {
-                if handle_connection(&mut stream, ui, engine, runtime)? == LoopControl::Quit {
+                if handle_connection(&mut stream, ui, engine, runtime, &session_state)?
+                    == LoopControl::Quit
+                {
                     break;
                 }
             }
@@ -56,6 +107,16 @@ pub fn run_web_shell(
         }
 
         let _ = runtime.run_tick_safe(engine, &mut audio, &mut midi_output);
+        let hardening = update_session_hardening(
+            engine,
+            runtime,
+            &mut dirty_tracker,
+            &mut autosave,
+            &autosave_path,
+            &dirty_flag_path,
+        );
+        session_state.dirty = hardening.dirty;
+        session_state.autosave_status = hardening.autosave_status;
         std::thread::sleep(Duration::from_millis(TICK_SLEEP_MS));
     }
 
@@ -81,6 +142,7 @@ fn handle_connection(
     ui: &mut UiController,
     engine: &mut Engine,
     runtime: &mut RuntimeCoordinator,
+    session_state: &GuiSessionState,
 ) -> io::Result<LoopControl> {
     let mut buffer = [0u8; 8192];
     let read = stream.read(&mut buffer)?;
@@ -102,7 +164,7 @@ fn handle_connection(
             Ok(LoopControl::Continue)
         }
         ("GET", "/state") => {
-            let body = build_state_json(ui, engine, runtime);
+            let body = build_state_json(ui, engine, runtime, session_state);
             write_text_response(stream, 200, "application/json; charset=utf-8", &body)?;
             Ok(LoopControl::Continue)
         }
@@ -149,6 +211,18 @@ fn apply_gui_command(
     engine: &mut Engine,
     runtime: &mut RuntimeCoordinator,
 ) -> String {
+    match command {
+        "play" => {
+            runtime.enqueue_command(RuntimeCommand::Start);
+            return String::from("info: transport start queued");
+        }
+        "stop" => {
+            runtime.enqueue_command(RuntimeCommand::Stop);
+            return String::from("info: transport stop queued");
+        }
+        _ => {}
+    }
+
     let action = match command {
         "toggle_play" => Some(UiAction::TogglePlayStop),
         "rewind" => Some(UiAction::RewindTransport),
@@ -206,7 +280,12 @@ fn cursor_up_action(snapshot: UiSnapshot) -> UiAction {
     }
 }
 
-fn build_state_json(ui: &UiController, engine: &Engine, runtime: &RuntimeCoordinator) -> String {
+fn build_state_json(
+    ui: &UiController,
+    engine: &Engine,
+    runtime: &RuntimeCoordinator,
+    session_state: &GuiSessionState,
+) -> String {
     let ui_snapshot = ui.snapshot(engine, runtime);
     let transport = runtime.snapshot();
     let project = engine.snapshot();
@@ -217,7 +296,7 @@ fn build_state_json(ui: &UiController, engine: &Engine, runtime: &RuntimeCoordin
     let mixer_view = build_mixer_view_json(project, ui_snapshot);
 
     format!(
-        "{{\"screen\":\"{}\",\"transport\":{{\"tick\":{},\"playing\":{},\"tempo\":{}}},\"cursor\":{{\"track\":{},\"song_row\":{},\"chain_row\":{},\"phrase_id\":{},\"step\":{},\"track_level\":{}}},\"scale_highlight\":\"{:?}\",\"views\":{{\"song\":{},\"chain\":{},\"phrase\":{},\"mixer\":{}}}}}",
+        "{{\"screen\":\"{}\",\"transport\":{{\"tick\":{},\"playing\":{},\"tempo\":{}}},\"cursor\":{{\"track\":{},\"song_row\":{},\"chain_row\":{},\"phrase_id\":{},\"step\":{},\"track_level\":{}}},\"status\":{{\"transport\":\"{}\",\"recovery\":\"{}\",\"dirty\":{},\"autosave\":\"{}\",\"queued_commands\":{},\"processed_commands\":{}}},\"scale_highlight\":\"{:?}\",\"views\":{{\"song\":{},\"chain\":{},\"phrase\":{},\"mixer\":{}}}}}",
         screen_label(ui_snapshot.screen),
         transport.tick,
         transport.is_playing,
@@ -228,12 +307,67 @@ fn build_state_json(ui: &UiController, engine: &Engine, runtime: &RuntimeCoordin
         ui_snapshot.selected_phrase_id,
         ui_snapshot.selected_step,
         ui_snapshot.focused_track_level,
+        transport_label(transport.is_playing),
+        session_state.recovery.label(),
+        session_state.dirty,
+        json_escape(&session_state.autosave_status),
+        transport.queued_commands,
+        transport.processed_commands,
         ui_snapshot.scale_highlight,
         song_view,
         chain_view,
         phrase_view,
         mixer_view,
     )
+}
+
+fn update_session_hardening(
+    engine: &Engine,
+    runtime: &RuntimeCoordinator,
+    dirty_tracker: &mut DirtyStateTracker,
+    autosave: &mut AutosaveManager,
+    autosave_path: &Path,
+    dirty_flag_path: &Path,
+) -> SessionHardeningState {
+    let mut dirty = dirty_tracker.is_dirty(engine);
+    let mut autosave_status = String::from("idle");
+
+    if dirty && mark_dirty_session_flag(dirty_flag_path).is_err() {
+        autosave_status = String::from("flag-error");
+    }
+
+    match autosave.save_if_due(engine, runtime.snapshot(), dirty, autosave_path) {
+        Ok(true) => {
+            dirty_tracker.mark_saved(engine);
+            dirty = false;
+            if clear_dirty_session_flag(dirty_flag_path).is_err() {
+                autosave_status = format!("saved@{}+flag-error", autosave.last_saved_tick());
+            } else {
+                autosave_status = format!("saved@{}", autosave.last_saved_tick());
+            }
+        }
+        Ok(false) => {
+            if !dirty {
+                let _ = clear_dirty_session_flag(dirty_flag_path);
+            }
+        }
+        Err(_) => {
+            autosave_status = String::from("error");
+        }
+    }
+
+    if autosave_status == "idle" {
+        autosave_status = if dirty {
+            String::from("pending")
+        } else {
+            String::from("clean")
+        };
+    }
+
+    SessionHardeningState {
+        dirty,
+        autosave_status,
+    }
 }
 
 fn build_song_view_json(project: &ProjectData, snapshot: UiSnapshot) -> String {
@@ -463,6 +597,14 @@ fn screen_label(screen: UiScreen) -> &'static str {
     }
 }
 
+fn transport_label(playing: bool) -> &'static str {
+    if playing {
+        "play"
+    } else {
+        "stop"
+    }
+}
+
 fn parse_request_line(line: &str) -> Option<(&str, &str)> {
     let mut parts = line.split_whitespace();
     let method = parts.next()?;
@@ -665,8 +807,8 @@ footer { margin-top: 12px; color: var(--muted); font-size: 0.85rem; }
 <body>
 <main>
   <header>
-    <h1>P9 Tracker GUI Shell (Phase 17.2)</h1>
-    <span class="small">core screens + live data binding</span>
+    <h1>P9 Tracker GUI Shell (Phase 17.3)</h1>
+    <span class="small">transport and keyboard input layer</span>
   </header>
 
   <section class="panel">
@@ -682,7 +824,9 @@ footer { margin-top: 12px; color: var(--muted); font-size: 0.85rem; }
     <div>
       <h3>Transport</h3>
       <div class="controls">
-        <button onclick="sendCmd('toggle_play')">Play/Stop</button>
+        <button onclick="sendCmd('play')">Play</button>
+        <button onclick="sendCmd('stop')">Stop</button>
+        <button onclick="sendCmd('toggle_play')">Toggle</button>
         <button onclick="sendCmd('rewind')">Rewind</button>
       </div>
       <div class="controls" style="margin-top:8px">
@@ -699,6 +843,9 @@ footer { margin-top: 12px; color: var(--muted); font-size: 0.85rem; }
       </div>
       <div class="controls" style="margin-top:8px">
         <button onclick="sendCmd('toggle_scale')">Toggle Scale Hint</button>
+      </div>
+      <div class="small" style="margin-top:10px">
+        Keys: Space/T toggle, G play, S stop, R rewind, arrows or H/J/K/L move, N/P switch screen.
       </div>
     </div>
 
@@ -759,19 +906,43 @@ footer { margin-top: 12px; color: var(--muted); font-size: 0.85rem; }
 
   <section class="panel">
     <h3>Status</h3>
-    <div id="status">ready</div>
+    <div class="kv"><span>Transport State</span><strong id="transport-state">-</strong></div>
+    <div class="kv"><span>Recovery</span><strong id="recovery-state">-</strong></div>
+    <div class="kv"><span>Dirty</span><strong id="dirty-state">-</strong></div>
+    <div class="kv"><span>Autosave</span><strong id="autosave-state">-</strong></div>
+    <div class="kv"><span>Runtime Queue</span><strong id="queue-state">-</strong></div>
+    <div class="kv"><span>Last Command</span><strong id="status">ready</strong></div>
     <div class="controls" style="margin-top:10px">
       <button class="danger" onclick="sendCmd('quit')">Quit GUI Shell</button>
     </div>
   </section>
 
   <footer>
-    Phase 17.2 goal: Song/Chain/Phrase/Mixer screens are live-bound to runtime snapshots with deterministic refresh.
+    Phase 17.3 goal: transport controls, keyboard routing, and status indicators are wired to realtime runtime state.
   </footer>
 </main>
 
 <script>
 const tabs = ['song', 'chain', 'phrase', 'mixer'];
+const keyMap = {
+  Space: 'toggle_play',
+  KeyT: 'toggle_play',
+  KeyG: 'play',
+  KeyS: 'stop',
+  KeyR: 'rewind',
+  ArrowLeft: 'track_left',
+  ArrowRight: 'track_right',
+  ArrowUp: 'cursor_up',
+  ArrowDown: 'cursor_down',
+  KeyH: 'track_left',
+  KeyL: 'track_right',
+  KeyK: 'cursor_up',
+  KeyJ: 'cursor_down',
+  KeyN: 'screen_next',
+  KeyP: 'screen_prev',
+  KeyX: 'toggle_scale',
+  KeyQ: 'quit',
+};
 
 function pad2(value) {
   return String(value).padStart(2, '0');
@@ -849,6 +1020,7 @@ async function refreshState() {
     const state = await response.json();
     const transport = state.transport;
     const cursor = state.cursor;
+    const status = state.status;
 
     document.getElementById('tick').textContent = transport.tick;
     document.getElementById('playing').textContent = transport.playing ? 'yes' : 'no';
@@ -859,6 +1031,11 @@ async function refreshState() {
     document.getElementById('phrase-step').textContent = `${cursor.phrase_id} / ${cursor.step}`;
     document.getElementById('track-level').textContent = cursor.track_level;
     document.getElementById('scale-highlight').textContent = state.scale_highlight;
+    document.getElementById('transport-state').textContent = status.transport;
+    document.getElementById('recovery-state').textContent = status.recovery;
+    document.getElementById('dirty-state').textContent = status.dirty ? 'yes' : 'no';
+    document.getElementById('autosave-state').textContent = status.autosave;
+    document.getElementById('queue-state').textContent = `${status.queued_commands} queued / ${status.processed_commands} processed`;
 
     renderSong(state.views.song);
     renderChain(state.views.chain);
@@ -886,6 +1063,24 @@ async function sendCmd(cmd) {
   }
 }
 
+function initKeyboardRouting() {
+  document.addEventListener('keydown', (event) => {
+    const tag = event.target && event.target.tagName ? event.target.tagName : '';
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') {
+      return;
+    }
+
+    const cmd = keyMap[event.code];
+    if (!cmd) {
+      return;
+    }
+
+    event.preventDefault();
+    sendCmd(cmd);
+  });
+}
+
+initKeyboardRouting();
 setInterval(refreshState, 250);
 refreshState();
 </script>
@@ -898,10 +1093,20 @@ refreshState();
 mod tests {
     use super::{
         apply_gui_command, build_state_json, parse_request_line, query_value, split_path_and_query,
+        GuiSessionState,
     };
+    use crate::hardening::RecoveryStatus;
     use crate::runtime::RuntimeCoordinator;
     use crate::ui::{UiAction, UiController};
     use p9_core::engine::Engine;
+
+    fn session_state() -> GuiSessionState {
+        GuiSessionState {
+            recovery: RecoveryStatus::CleanStart,
+            dirty: false,
+            autosave_status: String::from("clean"),
+        }
+    }
 
     #[test]
     fn parse_request_line_extracts_method_and_target() {
@@ -936,15 +1141,32 @@ mod tests {
     }
 
     #[test]
+    fn apply_gui_command_queues_explicit_transport_commands() {
+        let mut ui = UiController::default();
+        let mut engine = Engine::new("gui");
+        let mut runtime = RuntimeCoordinator::new(24);
+
+        let play = apply_gui_command("play", &mut ui, &mut engine, &mut runtime);
+        let stop = apply_gui_command("stop", &mut ui, &mut engine, &mut runtime);
+
+        assert!(play.contains("queued"));
+        assert!(stop.contains("queued"));
+        assert_eq!(runtime.snapshot().queued_commands, 2);
+    }
+
+    #[test]
     fn build_state_json_contains_core_fields() {
         let ui = UiController::default();
         let engine = Engine::new("gui");
         let runtime = RuntimeCoordinator::new(24);
+        let session = session_state();
 
-        let json = build_state_json(&ui, &engine, &runtime);
+        let json = build_state_json(&ui, &engine, &runtime, &session);
 
         assert!(json.contains("\"screen\":\"song\""));
         assert!(json.contains("\"transport\":{"));
+        assert!(json.contains("\"status\":{"));
+        assert!(json.contains("\"recovery\":\"clean-start\""));
         assert!(json.contains("\"views\":{"));
         assert!(json.contains("\"song\":{"));
         assert!(json.contains("\"chain\":{"));
@@ -957,6 +1179,7 @@ mod tests {
         let mut ui = UiController::default();
         let mut engine = Engine::new("gui");
         let mut runtime = RuntimeCoordinator::new(24);
+        let session = session_state();
 
         ui.handle_action(UiAction::EnsureChain { chain_id: 0 }, &mut engine, &mut runtime)
             .unwrap();
@@ -999,7 +1222,7 @@ mod tests {
         )
         .unwrap();
 
-        let json = build_state_json(&ui, &engine, &runtime);
+        let json = build_state_json(&ui, &engine, &runtime, &session);
 
         assert!(json.contains("\"bound_chain_id\":0"));
         assert!(json.contains("\"phrase_id\":0"));
@@ -1013,9 +1236,10 @@ mod tests {
         let ui = UiController::default();
         let engine = Engine::new("gui");
         let runtime = RuntimeCoordinator::new(24);
+        let session = session_state();
 
-        let first = build_state_json(&ui, &engine, &runtime);
-        let second = build_state_json(&ui, &engine, &runtime);
+        let first = build_state_json(&ui, &engine, &runtime, &session);
+        let second = build_state_json(&ui, &engine, &runtime, &session);
 
         assert_eq!(first, second);
     }
