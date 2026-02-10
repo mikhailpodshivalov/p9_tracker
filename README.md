@@ -2,7 +2,7 @@
 
 ## Status
 
-- Current stage: `Phase 19.3c realtime routing telemetry completed`
+- Current stage: `Phase 19.3d FX interaction safety completed`
 - Main implementation stack: `Rust`
 
 ## Phase 1 Artifacts
@@ -161,6 +161,10 @@
 ## Phase 19.3c Artifacts
 
 - `docs/phase19_3c_realtime_routing_telemetry.md`
+
+## Phase 19.3d Artifacts
+
+- `docs/phase19_3d_fx_interaction_safety.md`
 
 ## Forward Plan
 

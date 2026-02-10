@@ -240,8 +240,8 @@ impl Scheduler {
         let render_mode = profile.render_mode;
         let sampler_render = profile.sampler_render;
         let (send_mfx, send_delay, send_reverb) = self.resolve_effective_send_levels(project, step.instrument_id);
-        let track_level = project.mixer.track_levels[track_index];
-        let master_level = project.mixer.master_level;
+        let track_level = project.mixer.track_levels[track_index].min(127);
+        let master_level = project.mixer.master_level.min(127);
         let mut note_length_steps = profile.note_length_steps;
         let synth_params = profile.synth_params;
 
@@ -598,7 +598,9 @@ impl Scheduler {
 }
 
 fn scale_send(instrument_send: u8, global_send: u8) -> u8 {
-    ((instrument_send as u16 * global_send as u16) / 127) as u8
+    let instrument = instrument_send.min(127) as u16;
+    let global = global_send.min(127) as u16;
+    ((instrument * global) / 127).min(127) as u8
 }
 
 #[cfg(test)]
@@ -1260,6 +1262,203 @@ mod tests {
         assert_eq!(routed.2, 50);
         assert_eq!(routed.3, 20);
         assert_eq!(routed.4, 45);
+    }
+
+    #[test]
+    fn routing_levels_are_clamped_for_safety() {
+        let mut engine = setup_engine();
+        let mut instrument = Instrument::new(0, InstrumentType::Synth, "Clamp");
+        instrument.send_levels.mfx = 255;
+        instrument.send_levels.delay = 200;
+        instrument.send_levels.reverb = 180;
+        engine
+            .apply_command(EngineCommand::UpsertInstrument { instrument })
+            .unwrap();
+        engine
+            .apply_command(EngineCommand::SetTrackLevel {
+                track_index: 0,
+                level: 240,
+            })
+            .unwrap();
+        engine
+            .apply_command(EngineCommand::SetMasterLevel { level: 250 })
+            .unwrap();
+        engine
+            .apply_command(EngineCommand::SetMixerSends {
+                mfx: 255,
+                delay: 255,
+                reverb: 255,
+            })
+            .unwrap();
+        engine
+            .apply_command(EngineCommand::SetPhraseStep {
+                phrase_id: 0,
+                step_index: 0,
+                note: Some(60),
+                velocity: 100,
+                instrument_id: Some(0),
+            })
+            .unwrap();
+
+        let mut scheduler = Scheduler::new(4);
+        let events = scheduler.tick(&engine);
+        let routed = events
+            .iter()
+            .find_map(|event| match event {
+                RenderEvent::NoteOn {
+                    track_level,
+                    master_level,
+                    send_mfx,
+                    send_delay,
+                    send_reverb,
+                    ..
+                } => Some((
+                    *track_level,
+                    *master_level,
+                    *send_mfx,
+                    *send_delay,
+                    *send_reverb,
+                )),
+                _ => None,
+            })
+            .expect("expected note on");
+
+        assert_eq!(routed.0, 127);
+        assert_eq!(routed.1, 127);
+        assert_eq!(routed.2, 127);
+        assert_eq!(routed.3, 127);
+        assert_eq!(routed.4, 127);
+    }
+
+    #[test]
+    fn complex_fx_stack_and_routing_stays_deterministic() {
+        let mut engine = setup_engine();
+        let mut instrument = Instrument::new(0, InstrumentType::Synth, "Stack");
+        instrument.table_id = Some(0);
+        instrument.note_length_steps = 5;
+        instrument.send_levels.mfx = 64;
+        engine
+            .apply_command(EngineCommand::UpsertInstrument { instrument })
+            .unwrap();
+
+        let mut table = Table::new(0);
+        table.rows[0].note_offset = -1;
+        table.rows[0].volume = 64;
+        table.rows[0].fx[0] = Some(FxCommand {
+            code: "TRN".to_string(),
+            value: 49,
+        });
+        table.rows[0].fx[1] = Some(FxCommand {
+            code: "LEN".to_string(),
+            value: 2,
+        });
+        engine
+            .apply_command(EngineCommand::UpsertTable { table })
+            .unwrap();
+        engine
+            .apply_command(EngineCommand::SetMixerSends {
+                mfx: 64,
+                delay: 0,
+                reverb: 0,
+            })
+            .unwrap();
+        engine
+            .apply_command(EngineCommand::SetTrackLevel {
+                track_index: 0,
+                level: 96,
+            })
+            .unwrap();
+        engine
+            .apply_command(EngineCommand::SetMasterLevel { level: 112 })
+            .unwrap();
+        engine
+            .apply_command(EngineCommand::SetStepFx {
+                phrase_id: 0,
+                step_index: 0,
+                fx_slot: 0,
+                fx: Some(FxCommand {
+                    code: "TRN".to_string(),
+                    value: 50,
+                }),
+            })
+            .unwrap();
+        engine
+            .apply_command(EngineCommand::SetStepFx {
+                phrase_id: 0,
+                step_index: 0,
+                fx_slot: 1,
+                fx: Some(FxCommand {
+                    code: "VOL".to_string(),
+                    value: 90,
+                }),
+            })
+            .unwrap();
+        engine
+            .apply_command(EngineCommand::SetStepFx {
+                phrase_id: 0,
+                step_index: 0,
+                fx_slot: 2,
+                fx: Some(FxCommand {
+                    code: "LEN".to_string(),
+                    value: 3,
+                }),
+            })
+            .unwrap();
+        engine
+            .apply_command(EngineCommand::SetPhraseStep {
+                phrase_id: 0,
+                step_index: 0,
+                note: Some(60),
+                velocity: 100,
+                instrument_id: Some(0),
+            })
+            .unwrap();
+        engine
+            .apply_command(EngineCommand::SetPhraseStep {
+                phrase_id: 0,
+                step_index: 1,
+                note: None,
+                velocity: 80,
+                instrument_id: Some(0),
+            })
+            .unwrap();
+        engine
+            .apply_command(EngineCommand::SetPhraseStep {
+                phrase_id: 0,
+                step_index: 2,
+                note: None,
+                velocity: 80,
+                instrument_id: Some(0),
+            })
+            .unwrap();
+
+        let mut scheduler = Scheduler::new(4);
+        let t1 = scheduler.tick(&engine);
+        let t2 = scheduler.tick(&engine);
+        let t3 = scheduler.tick(&engine);
+
+        let note_on = t1
+            .iter()
+            .find_map(|event| match event {
+                RenderEvent::NoteOn {
+                    note,
+                    velocity,
+                    track_level,
+                    master_level,
+                    send_mfx,
+                    ..
+                } => Some((*note, *velocity, *track_level, *master_level, *send_mfx)),
+                _ => None,
+            })
+            .expect("expected note on");
+
+        assert_eq!(note_on.0, 62);
+        assert_eq!(note_on.1, 45);
+        assert_eq!(note_on.2, 96);
+        assert_eq!(note_on.3, 112);
+        assert_eq!(note_on.4, 32);
+        assert_eq!(count_note_off(&t2), 0);
+        assert_eq!(count_note_off(&t3), 1);
     }
 
     fn count_note_on(events: &[RenderEvent]) -> usize {
