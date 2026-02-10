@@ -2,7 +2,7 @@
 
 ## Status
 
-- Current stage: `Phase 17.1 GUI stack and app shell completed`
+- Current stage: `Phase 17.2 core screens and data binding completed`
 - Main implementation stack: `Rust`
 
 ## Phase 1 Artifacts
@@ -93,6 +93,10 @@
 ## Phase 17.1 Artifacts
 
 - `docs/phase17_1_gui_stack_app_shell.md`
+
+## Phase 17.2 Artifacts
+
+- `docs/phase17_2_core_screens_data_binding.md`
 
 ## Forward Plan
 

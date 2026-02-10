@@ -3,9 +3,9 @@ use std::net::{TcpListener, TcpStream};
 use std::time::Duration;
 
 use crate::runtime::RuntimeCoordinator;
-use crate::ui::{UiAction, UiController, UiError, UiScreen};
+use crate::ui::{UiAction, UiController, UiError, UiScreen, UiSnapshot};
 use p9_core::engine::Engine;
-use p9_core::model::{CHAIN_ROW_COUNT, PHRASE_STEP_COUNT, SONG_ROW_COUNT};
+use p9_core::model::{ProjectData, Step, CHAIN_ROW_COUNT, PHRASE_STEP_COUNT, SONG_ROW_COUNT};
 use p9_rt::audio::{AudioBackend, NoopAudioBackend};
 use p9_rt::midi::NoopMidiOutput;
 
@@ -17,6 +17,8 @@ const BIND_ADDR_CANDIDATES: [&str; 5] = [
     "127.0.0.1:17721",
 ];
 const TICK_SLEEP_MS: u64 = 16;
+const SONG_VIEW_ROWS: usize = 8;
+const CHAIN_VIEW_ROWS: usize = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LoopControl {
@@ -33,7 +35,7 @@ pub fn run_web_shell(
     listener.set_nonblocking(true)?;
 
     println!(
-        "p9_tracker gui-shell stage17.1 running at http://{}",
+        "p9_tracker gui-shell stage17.2 running at http://{}",
         listener.local_addr()?
     );
     println!("Open this URL in browser. Press Ctrl+C or click Quit GUI Shell to stop.");
@@ -170,7 +172,7 @@ fn apply_gui_command(
     }
 }
 
-fn cursor_down_action(snapshot: crate::ui::UiSnapshot) -> UiAction {
+fn cursor_down_action(snapshot: UiSnapshot) -> UiAction {
     match snapshot.screen {
         UiScreen::Song => UiAction::SelectSongRow((snapshot.selected_song_row + 1) % SONG_ROW_COUNT),
         UiScreen::Chain => UiAction::SelectChainRow((snapshot.selected_chain_row + 1) % CHAIN_ROW_COUNT),
@@ -179,7 +181,7 @@ fn cursor_down_action(snapshot: crate::ui::UiSnapshot) -> UiAction {
     }
 }
 
-fn cursor_up_action(snapshot: crate::ui::UiSnapshot) -> UiAction {
+fn cursor_up_action(snapshot: UiSnapshot) -> UiAction {
     match snapshot.screen {
         UiScreen::Song => {
             let row = if snapshot.selected_song_row == 0 {
@@ -209,11 +211,16 @@ fn build_state_json(ui: &UiController, engine: &Engine, runtime: &RuntimeCoordin
     let transport = runtime.snapshot();
     let project = engine.snapshot();
 
+    let song_view = build_song_view_json(project, ui_snapshot);
+    let chain_view = build_chain_view_json(project, ui_snapshot);
+    let phrase_view = build_phrase_view_json(project, ui_snapshot);
+    let mixer_view = build_mixer_view_json(project, ui_snapshot);
+
     format!(
-        "{{\"screen\":\"{}\",\"tick\":{},\"playing\":{},\"tempo\":{},\"focused_track\":{},\"song_row\":{},\"chain_row\":{},\"phrase\":{},\"step\":{},\"track_level\":{},\"scale_highlight\":\"{:?}\"}}",
+        "{{\"screen\":\"{}\",\"transport\":{{\"tick\":{},\"playing\":{},\"tempo\":{}}},\"cursor\":{{\"track\":{},\"song_row\":{},\"chain_row\":{},\"phrase_id\":{},\"step\":{},\"track_level\":{}}},\"scale_highlight\":\"{:?}\",\"views\":{{\"song\":{},\"chain\":{},\"phrase\":{},\"mixer\":{}}}}}",
         screen_label(ui_snapshot.screen),
         transport.tick,
-        if transport.is_playing { "true" } else { "false" },
+        transport.is_playing,
         project.song.tempo,
         ui_snapshot.focused_track,
         ui_snapshot.selected_song_row,
@@ -222,7 +229,229 @@ fn build_state_json(ui: &UiController, engine: &Engine, runtime: &RuntimeCoordin
         ui_snapshot.selected_step,
         ui_snapshot.focused_track_level,
         ui_snapshot.scale_highlight,
+        song_view,
+        chain_view,
+        phrase_view,
+        mixer_view,
     )
+}
+
+fn build_song_view_json(project: &ProjectData, snapshot: UiSnapshot) -> String {
+    let window_start = centered_window_start(snapshot.selected_song_row, SONG_ROW_COUNT, SONG_VIEW_ROWS);
+    let window_end = window_start + SONG_VIEW_ROWS - 1;
+    let mut rows = String::new();
+
+    if let Some(track) = project.song.tracks.get(snapshot.focused_track) {
+        for row in window_start..=window_end {
+            if !rows.is_empty() {
+                rows.push(',');
+            }
+
+            let chain_id = track.song_rows.get(row).copied().flatten();
+            rows.push_str(&format!(
+                "{{\"row\":{},\"chain_id\":{},\"selected\":{}}}",
+                row,
+                option_u8_json(chain_id),
+                row == snapshot.selected_song_row,
+            ));
+        }
+    }
+
+    format!(
+        "{{\"window_start\":{},\"window_end\":{},\"rows\":[{}]}}",
+        window_start, window_end, rows
+    )
+}
+
+fn build_chain_view_json(project: &ProjectData, snapshot: UiSnapshot) -> String {
+    let bound_chain = bound_chain_id(project, snapshot);
+    let window_start = centered_window_start(snapshot.selected_chain_row, CHAIN_ROW_COUNT, CHAIN_VIEW_ROWS);
+    let window_end = window_start + CHAIN_VIEW_ROWS - 1;
+    let mut rows = String::new();
+    let mut exists = false;
+
+    if let Some(chain_id) = bound_chain {
+        if let Some(chain) = project.chains.get(&chain_id) {
+            exists = true;
+            for row in window_start..=window_end {
+                if !rows.is_empty() {
+                    rows.push(',');
+                }
+
+                let phrase_id = chain.rows.get(row).and_then(|entry| entry.phrase_id);
+                let transpose = chain.rows.get(row).map(|entry| entry.transpose).unwrap_or(0);
+
+                rows.push_str(&format!(
+                    "{{\"row\":{},\"phrase_id\":{},\"transpose\":{},\"selected\":{}}}",
+                    row,
+                    option_u8_json(phrase_id),
+                    transpose,
+                    row == snapshot.selected_chain_row,
+                ));
+            }
+        }
+    }
+
+    format!(
+        "{{\"bound_chain_id\":{},\"exists\":{},\"window_start\":{},\"window_end\":{},\"rows\":[{}]}}",
+        option_u8_json(bound_chain),
+        exists,
+        window_start,
+        window_end,
+        rows,
+    )
+}
+
+fn build_phrase_view_json(project: &ProjectData, snapshot: UiSnapshot) -> String {
+    let phrase_id = snapshot.selected_phrase_id;
+    let bound_phrase = bound_phrase_id(project, snapshot);
+    let phrase = project.phrases.get(&phrase_id);
+    let mut rows = String::new();
+
+    for step_index in 0..PHRASE_STEP_COUNT {
+        if !rows.is_empty() {
+            rows.push(',');
+        }
+
+        let (note, velocity, instrument_id, fx_label) = if let Some(phrase) = phrase {
+            if let Some(step) = phrase.steps.get(step_index) {
+                (
+                    step.note,
+                    step.velocity,
+                    step.instrument_id,
+                    step_fx_label(step),
+                )
+            } else {
+                (None, 0x40, None, String::from("--"))
+            }
+        } else {
+            (None, 0x40, None, String::from("--"))
+        };
+
+        rows.push_str(&format!(
+            "{{\"step\":{},\"note\":{},\"velocity\":{},\"instrument_id\":{},\"fx\":\"{}\",\"scale\":\"{}\",\"selected\":{}}}",
+            step_index,
+            option_u8_json(note),
+            velocity,
+            option_u8_json(instrument_id),
+            json_escape(&fx_label),
+            step_scale_label(project, snapshot, note),
+            step_index == snapshot.selected_step,
+        ));
+    }
+
+    format!(
+        "{{\"selected_phrase_id\":{},\"bound_phrase_id\":{},\"exists\":{},\"rows\":[{}]}}",
+        phrase_id,
+        option_u8_json(bound_phrase),
+        phrase.is_some(),
+        rows,
+    )
+}
+
+fn build_mixer_view_json(project: &ProjectData, snapshot: UiSnapshot) -> String {
+    let mut tracks = String::new();
+
+    for (track_index, level) in project.mixer.track_levels.iter().enumerate() {
+        if !tracks.is_empty() {
+            tracks.push(',');
+        }
+        tracks.push_str(&format!(
+            "{{\"track\":{},\"level\":{},\"focused\":{}}}",
+            track_index,
+            level,
+            track_index == snapshot.focused_track,
+        ));
+    }
+
+    format!(
+        "{{\"master_level\":{},\"send_mfx\":{},\"send_delay\":{},\"send_reverb\":{},\"tracks\":[{}]}}",
+        project.mixer.master_level,
+        project.mixer.send_levels.mfx,
+        project.mixer.send_levels.delay,
+        project.mixer.send_levels.reverb,
+        tracks,
+    )
+}
+
+fn bound_chain_id(project: &ProjectData, snapshot: UiSnapshot) -> Option<u8> {
+    project
+        .song
+        .tracks
+        .get(snapshot.focused_track)
+        .and_then(|track| track.song_rows.get(snapshot.selected_song_row))
+        .copied()
+        .flatten()
+}
+
+fn bound_phrase_id(project: &ProjectData, snapshot: UiSnapshot) -> Option<u8> {
+    let chain_id = bound_chain_id(project, snapshot)?;
+    project
+        .chains
+        .get(&chain_id)
+        .and_then(|chain| chain.rows.get(snapshot.selected_chain_row))
+        .and_then(|row| row.phrase_id)
+}
+
+fn step_fx_label(step: &Step) -> String {
+    let mut slots = Vec::new();
+
+    for fx in step.fx.iter().flatten() {
+        slots.push(format!("{}{:03}", fx.code, fx.value));
+    }
+
+    if slots.is_empty() {
+        String::from("--")
+    } else {
+        slots.join(" ")
+    }
+}
+
+fn step_scale_label(project: &ProjectData, snapshot: UiSnapshot, note: Option<u8>) -> &'static str {
+    let Some(note) = note else {
+        return "none";
+    };
+
+    match is_note_in_track_scale(project, snapshot, note) {
+        Some(true) => "in",
+        Some(false) => "out",
+        None => "unknown",
+    }
+}
+
+fn is_note_in_track_scale(project: &ProjectData, snapshot: UiSnapshot, note: u8) -> Option<bool> {
+    let track = project.song.tracks.get(snapshot.focused_track)?;
+    let scale_id = track.scale_override.unwrap_or(project.song.default_scale);
+    let scale = project.scales.get(&scale_id)?;
+
+    if scale.interval_mask == 0 {
+        return Some(false);
+    }
+
+    let key = scale.key % 12;
+    let pitch_class = note % 12;
+    let interval = ((12 + pitch_class as i16 - key as i16) % 12) as u32;
+
+    Some(((u32::from(scale.interval_mask) >> interval) & 1) != 0)
+}
+
+fn centered_window_start(selected: usize, total_rows: usize, window_rows: usize) -> usize {
+    let clamped_window = window_rows.min(total_rows.max(1));
+    if total_rows <= clamped_window {
+        return 0;
+    }
+
+    let mut start = selected.saturating_sub(clamped_window / 2);
+    if start + clamped_window > total_rows {
+        start = total_rows - clamped_window;
+    }
+    start
+}
+
+fn option_u8_json(value: Option<u8>) -> String {
+    value
+        .map(|item| item.to_string())
+        .unwrap_or_else(|| String::from("null"))
 }
 
 fn screen_label(screen: UiScreen) -> &'static str {
@@ -288,7 +517,10 @@ fn write_text_response(
 }
 
 fn json_escape(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"")
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
 }
 
 fn ui_error_label(error: UiError) -> &'static str {
@@ -316,6 +548,8 @@ fn index_html() -> &'static str {
   --accent: #ff6f3c;
   --muted: #68707a;
   --line: #d8dcd2;
+  --good: #1f7a2f;
+  --warn: #c63b2d;
 }
 * { box-sizing: border-box; }
 body {
@@ -325,7 +559,7 @@ body {
   color: var(--ink);
 }
 main {
-  max-width: 980px;
+  max-width: 1180px;
   margin: 20px auto;
   padding: 0 16px 24px;
 }
@@ -347,6 +581,29 @@ header {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 12px;
+}
+.views {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+.view {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 10px;
+  background: #fbfcfa;
+}
+.view.active {
+  border-color: var(--accent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 30%, transparent);
+}
+.view h4 {
+  margin: 0 0 8px;
+}
+.view-meta {
+  color: var(--muted);
+  font-size: 0.85rem;
+  margin-bottom: 8px;
 }
 .tabs {
   display: grid;
@@ -381,9 +638,26 @@ button {
 button:hover { border-color: var(--accent); }
 button.danger { border-color: #c63b2d; color: #c63b2d; }
 .kv { display: grid; grid-template-columns: 180px 1fr; gap: 8px; }
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: "IBM Plex Mono", "Consolas", monospace;
+  font-size: 0.86rem;
+}
+th, td {
+  border-bottom: 1px solid var(--line);
+  padding: 4px 6px;
+  text-align: left;
+}
+tr.selected td { background: #fff0e7; }
+.note-in { color: var(--good); }
+.note-out { color: var(--warn); font-weight: 600; }
 footer { margin-top: 12px; color: var(--muted); font-size: 0.85rem; }
-@media (max-width: 720px) {
+@media (max-width: 980px) {
   .grid { grid-template-columns: 1fr; }
+  .views { grid-template-columns: 1fr; }
+}
+@media (max-width: 720px) {
   .kv { grid-template-columns: 1fr; }
 }
 </style>
@@ -391,8 +665,8 @@ footer { margin-top: 12px; color: var(--muted); font-size: 0.85rem; }
 <body>
 <main>
   <header>
-    <h1>P9 Tracker GUI Shell (Phase 17.1)</h1>
-    <span class="small">non-terminal foundation + runtime bridge</span>
+    <h1>P9 Tracker GUI Shell (Phase 17.2)</h1>
+    <span class="small">core screens + live data binding</span>
   </header>
 
   <section class="panel">
@@ -443,6 +717,47 @@ footer { margin-top: 12px; color: var(--muted); font-size: 0.85rem; }
   </section>
 
   <section class="panel">
+    <h3>Screens</h3>
+    <div class="views">
+      <article class="view" id="view-song">
+        <h4>Song</h4>
+        <div class="view-meta" id="song-meta">-</div>
+        <table>
+          <thead><tr><th>Row</th><th>Chain</th></tr></thead>
+          <tbody id="song-body"></tbody>
+        </table>
+      </article>
+
+      <article class="view" id="view-chain">
+        <h4>Chain</h4>
+        <div class="view-meta" id="chain-meta">-</div>
+        <table>
+          <thead><tr><th>Row</th><th>Phrase</th><th>Trn</th></tr></thead>
+          <tbody id="chain-body"></tbody>
+        </table>
+      </article>
+
+      <article class="view" id="view-phrase">
+        <h4>Phrase</h4>
+        <div class="view-meta" id="phrase-meta">-</div>
+        <table>
+          <thead><tr><th>Step</th><th>Note</th><th>Vel</th><th>Inst</th><th>FX</th></tr></thead>
+          <tbody id="phrase-body"></tbody>
+        </table>
+      </article>
+
+      <article class="view" id="view-mixer">
+        <h4>Mixer</h4>
+        <div class="view-meta" id="mixer-meta">-</div>
+        <table>
+          <thead><tr><th>Track</th><th>Level</th></tr></thead>
+          <tbody id="mixer-body"></tbody>
+        </table>
+      </article>
+    </div>
+  </section>
+
+  <section class="panel">
     <h3>Status</h3>
     <div id="status">ready</div>
     <div class="controls" style="margin-top:10px">
@@ -451,30 +766,105 @@ footer { margin-top: 12px; color: var(--muted); font-size: 0.85rem; }
   </section>
 
   <footer>
-    Phase 17.1 goal: GUI stack + app shell lifecycle. Terminal fallback stays available with <code>--ui-shell</code>.
+    Phase 17.2 goal: Song/Chain/Phrase/Mixer screens are live-bound to runtime snapshots with deterministic refresh.
   </footer>
 </main>
 
 <script>
 const tabs = ['song', 'chain', 'phrase', 'mixer'];
 
+function pad2(value) {
+  return String(value).padStart(2, '0');
+}
+
+function fmtOptional(value, padded = false) {
+  if (value === null || value === undefined) {
+    return '--';
+  }
+  return padded ? pad2(value) : String(value);
+}
+
+function setActiveScreen(screen) {
+  tabs.forEach((tab) => {
+    document.getElementById(`tab-${tab}`).classList.toggle('active', screen === tab);
+    document.getElementById(`view-${tab}`).classList.toggle('active', screen === tab);
+  });
+}
+
+function renderSong(view) {
+  document.getElementById('song-meta').textContent = `rows ${view.window_start}..${view.window_end}`;
+  const body = view.rows.map((row) => {
+    const selected = row.selected ? 'selected' : '';
+    return `<tr class="${selected}"><td>${pad2(row.row)}</td><td>${fmtOptional(row.chain_id, true)}</td></tr>`;
+  }).join('');
+  document.getElementById('song-body').innerHTML = body;
+}
+
+function renderChain(view) {
+  const label = view.bound_chain_id === null
+    ? 'no chain on selected song row'
+    : `chain ${pad2(view.bound_chain_id)} (${view.exists ? 'loaded' : 'missing'}) rows ${view.window_start}..${view.window_end}`;
+  document.getElementById('chain-meta').textContent = label;
+
+  if (!view.exists || view.rows.length === 0) {
+    document.getElementById('chain-body').innerHTML = '<tr><td colspan="3">No chain data</td></tr>';
+    return;
+  }
+
+  const body = view.rows.map((row) => {
+    const selected = row.selected ? 'selected' : '';
+    const transpose = row.transpose >= 0 ? `+${row.transpose}` : `${row.transpose}`;
+    return `<tr class="${selected}"><td>${pad2(row.row)}</td><td>${fmtOptional(row.phrase_id, true)}</td><td>${transpose}</td></tr>`;
+  }).join('');
+  document.getElementById('chain-body').innerHTML = body;
+}
+
+function renderPhrase(view) {
+  const bound = fmtOptional(view.bound_phrase_id, true);
+  const selected = fmtOptional(view.selected_phrase_id, true);
+  document.getElementById('phrase-meta').textContent = `selected ${selected} | bound ${bound} | ${view.exists ? 'loaded' : 'missing'}`;
+
+  const body = view.rows.map((step) => {
+    const selectedClass = step.selected ? 'selected' : '';
+    const noteClass = step.scale === 'out' ? 'note-out' : (step.scale === 'in' ? 'note-in' : '');
+    const note = fmtOptional(step.note, false);
+    return `<tr class="${selectedClass}"><td>${pad2(step.step)}</td><td class="${noteClass}">${note}</td><td>${step.velocity}</td><td>${fmtOptional(step.instrument_id, true)}</td><td>${step.fx}</td></tr>`;
+  }).join('');
+
+  document.getElementById('phrase-body').innerHTML = body;
+}
+
+function renderMixer(view) {
+  document.getElementById('mixer-meta').textContent = `master ${view.master_level} | send mfx ${view.send_mfx} delay ${view.send_delay} reverb ${view.send_reverb}`;
+  const body = view.tracks.map((track) => {
+    const selected = track.focused ? 'selected' : '';
+    return `<tr class="${selected}"><td>${track.track}</td><td>${track.level}</td></tr>`;
+  }).join('');
+  document.getElementById('mixer-body').innerHTML = body;
+}
+
 async function refreshState() {
   try {
     const response = await fetch('/state');
     const state = await response.json();
-    document.getElementById('tick').textContent = state.tick;
-    document.getElementById('playing').textContent = state.playing ? 'yes' : 'no';
-    document.getElementById('tempo').textContent = state.tempo;
-    document.getElementById('track').textContent = state.focused_track;
-    document.getElementById('song-row').textContent = state.song_row;
-    document.getElementById('chain-row').textContent = state.chain_row;
-    document.getElementById('phrase-step').textContent = `${state.phrase} / ${state.step}`;
-    document.getElementById('track-level').textContent = state.track_level;
+    const transport = state.transport;
+    const cursor = state.cursor;
+
+    document.getElementById('tick').textContent = transport.tick;
+    document.getElementById('playing').textContent = transport.playing ? 'yes' : 'no';
+    document.getElementById('tempo').textContent = transport.tempo;
+    document.getElementById('track').textContent = cursor.track;
+    document.getElementById('song-row').textContent = cursor.song_row;
+    document.getElementById('chain-row').textContent = cursor.chain_row;
+    document.getElementById('phrase-step').textContent = `${cursor.phrase_id} / ${cursor.step}`;
+    document.getElementById('track-level').textContent = cursor.track_level;
     document.getElementById('scale-highlight').textContent = state.scale_highlight;
 
-    tabs.forEach((tab) => {
-      document.getElementById(`tab-${tab}`).classList.toggle('active', state.screen === tab);
-    });
+    renderSong(state.views.song);
+    renderChain(state.views.chain);
+    renderPhrase(state.views.phrase);
+    renderMixer(state.views.mixer);
+    setActiveScreen(state.screen);
   } catch (error) {
     document.getElementById('status').textContent = `error: ${error}`;
   }
@@ -510,7 +900,7 @@ mod tests {
         apply_gui_command, build_state_json, parse_request_line, query_value, split_path_and_query,
     };
     use crate::runtime::RuntimeCoordinator;
-    use crate::ui::UiController;
+    use crate::ui::{UiAction, UiController};
     use p9_core::engine::Engine;
 
     #[test]
@@ -554,7 +944,79 @@ mod tests {
         let json = build_state_json(&ui, &engine, &runtime);
 
         assert!(json.contains("\"screen\":\"song\""));
-        assert!(json.contains("\"tick\":"));
-        assert!(json.contains("\"tempo\":"));
+        assert!(json.contains("\"transport\":{"));
+        assert!(json.contains("\"views\":{"));
+        assert!(json.contains("\"song\":{"));
+        assert!(json.contains("\"chain\":{"));
+        assert!(json.contains("\"phrase\":{"));
+        assert!(json.contains("\"mixer\":{"));
+    }
+
+    #[test]
+    fn build_state_json_includes_bound_entities() {
+        let mut ui = UiController::default();
+        let mut engine = Engine::new("gui");
+        let mut runtime = RuntimeCoordinator::new(24);
+
+        ui.handle_action(UiAction::EnsureChain { chain_id: 0 }, &mut engine, &mut runtime)
+            .unwrap();
+        ui.handle_action(UiAction::EnsurePhrase { phrase_id: 0 }, &mut engine, &mut runtime)
+            .unwrap();
+        ui.handle_action(
+            UiAction::BindTrackRowToChain {
+                song_row: 0,
+                chain_id: Some(0),
+            },
+            &mut engine,
+            &mut runtime,
+        )
+        .unwrap();
+        ui.handle_action(
+            UiAction::BindChainRowToPhrase {
+                chain_id: 0,
+                chain_row: 0,
+                phrase_id: Some(0),
+                transpose: 1,
+            },
+            &mut engine,
+            &mut runtime,
+        )
+        .unwrap();
+        ui.handle_action(UiAction::SelectPhrase(0), &mut engine, &mut runtime)
+            .unwrap();
+        ui.handle_action(UiAction::SelectStep(0), &mut engine, &mut runtime)
+            .unwrap();
+        ui.handle_action(
+            UiAction::EditStep {
+                phrase_id: 0,
+                step_index: 0,
+                note: Some(61),
+                velocity: 100,
+                instrument_id: Some(0),
+            },
+            &mut engine,
+            &mut runtime,
+        )
+        .unwrap();
+
+        let json = build_state_json(&ui, &engine, &runtime);
+
+        assert!(json.contains("\"bound_chain_id\":0"));
+        assert!(json.contains("\"phrase_id\":0"));
+        assert!(json.contains("\"selected_phrase_id\":0"));
+        assert!(json.contains("\"step\":0"));
+        assert!(json.contains("\"track\":0"));
+    }
+
+    #[test]
+    fn build_state_json_is_deterministic_for_same_snapshot() {
+        let ui = UiController::default();
+        let engine = Engine::new("gui");
+        let runtime = RuntimeCoordinator::new(24);
+
+        let first = build_state_json(&ui, &engine, &runtime);
+        let second = build_state_json(&ui, &engine, &runtime);
+
+        assert_eq!(first, second);
     }
 }
