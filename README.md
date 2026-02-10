@@ -2,7 +2,7 @@
 
 ## Status
 
-- Current stage: `Phase 18.1 step editor parity completed`
+- Current stage: `Phase 18.2 selection/block ops and undo/redo UX completed`
 - Main implementation stack: `Rust`
 
 ## Phase 1 Artifacts
@@ -109,6 +109,10 @@
 ## Phase 18.1 Artifacts
 
 - `docs/phase18_1_step_editor_parity.md`
+
+## Phase 18.2 Artifacts
+
+- `docs/phase18_2_selection_block_undo_redo.md`
 
 ## Forward Plan
 

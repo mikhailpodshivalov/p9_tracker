@@ -9,6 +9,9 @@ use crate::hardening::{
     DirtyStateTracker, RecoveryStatus,
 };
 use crate::runtime::{RuntimeCommand, RuntimeCoordinator};
+use crate::ui_shell::{
+    apply_shell_command_with_history_state, ProjectHistory, ShellCommandResult, ShellEditState,
+};
 use crate::ui::{UiAction, UiController, UiError, UiScreen, UiSnapshot};
 use p9_core::engine::Engine;
 use p9_core::model::{ProjectData, Step, CHAIN_ROW_COUNT, PHRASE_STEP_COUNT, SONG_ROW_COUNT};
@@ -25,6 +28,7 @@ const BIND_ADDR_CANDIDATES: [&str; 5] = [
 ];
 const TICK_SLEEP_MS: u64 = 16;
 const GUI_AUTOSAVE_INTERVAL_TICKS: u64 = 16;
+const GUI_HISTORY_LIMIT: usize = 128;
 const SONG_VIEW_ROWS: usize = 8;
 const CHAIN_VIEW_ROWS: usize = 8;
 const RECENT_PROJECT_LIMIT: usize = 6;
@@ -42,6 +46,8 @@ struct GuiSessionState {
     autosave_status: String,
     current_project_path: Option<PathBuf>,
     recent_project_paths: Vec<PathBuf>,
+    history: ProjectHistory,
+    edit_state: ShellEditState,
 }
 
 #[derive(Clone, Debug)]
@@ -65,6 +71,8 @@ impl GuiSessionState {
             autosave_status: String::from("unknown"),
             current_project_path: None,
             recent_project_paths: Vec::new(),
+            history: ProjectHistory::with_limit(GUI_HISTORY_LIMIT),
+            edit_state: ShellEditState::default(),
         }
     }
 }
@@ -87,7 +95,7 @@ pub fn run_web_shell(
     listener.set_nonblocking(true)?;
 
     println!(
-        "p9_tracker gui-shell stage18.1 running at http://{}",
+        "p9_tracker gui-shell stage18.2 running at http://{}",
         listener.local_addr()?
     );
     println!("Open this URL in browser. Press Ctrl+C or click Quit GUI Shell to stop.");
@@ -270,6 +278,8 @@ fn execute_action_command(
             session_state.current_project_path = None;
             session_state.dirty = false;
             session_state.autosave_status = String::from("clean");
+            session_state.history = ProjectHistory::with_limit(GUI_HISTORY_LIMIT);
+            session_state.edit_state = ShellEditState::default();
             dirty_tracker.mark_saved(engine);
             ActionOutcome {
                 status: String::from("info: new project created"),
@@ -293,6 +303,8 @@ fn execute_action_command(
                     dirty_tracker.mark_saved(engine);
                     session_state.dirty = false;
                     session_state.autosave_status = String::from("loaded");
+                    session_state.history = ProjectHistory::with_limit(GUI_HISTORY_LIMIT);
+                    session_state.edit_state = ShellEditState::default();
                     session_state.current_project_path = Some(target_path.clone());
                     register_recent_path(session_state, target_path);
                     ActionOutcome {
@@ -372,7 +384,15 @@ fn execute_action_command(
             }
         }
         _ => ActionOutcome {
-            status: apply_gui_command_with_query(command, query, ui, engine, runtime),
+            status: apply_gui_command_with_query(
+                command,
+                query,
+                ui,
+                engine,
+                runtime,
+                &mut session_state.history,
+                &mut session_state.edit_state,
+            ),
             quit: false,
             confirm_required: false,
         },
@@ -422,7 +442,17 @@ fn apply_gui_command(
     engine: &mut Engine,
     runtime: &mut RuntimeCoordinator,
 ) -> String {
-    apply_gui_command_with_query(command, None, ui, engine, runtime)
+    let mut history = ProjectHistory::with_limit(GUI_HISTORY_LIMIT);
+    let mut edit_state = ShellEditState::default();
+    apply_gui_command_with_query(
+        command,
+        None,
+        ui,
+        engine,
+        runtime,
+        &mut history,
+        &mut edit_state,
+    )
 }
 
 fn apply_gui_command_with_query(
@@ -431,6 +461,8 @@ fn apply_gui_command_with_query(
     ui: &mut UiController,
     engine: &mut Engine,
     runtime: &mut RuntimeCoordinator,
+    history: &mut ProjectHistory,
+    edit_state: &mut ShellEditState,
 ) -> String {
     match command {
         "play" => {
@@ -442,80 +474,47 @@ fn apply_gui_command_with_query(
             return String::from("info: transport stop queued");
         }
         "edit_bind_chain" => {
-            let snapshot = ui.snapshot(engine, runtime);
-            let chain_id = snapshot.selected_song_row as u8;
-
-            if let Err(err) = ui.handle_action(UiAction::EnsureChain { chain_id }, engine, runtime) {
-                return format!("error: action 'edit_bind_chain' failed: {}", ui_error_label(err));
-            }
-            if let Err(err) = ui.handle_action(
-                UiAction::BindTrackRowToChain {
-                    song_row: snapshot.selected_song_row,
-                    chain_id: Some(chain_id),
-                },
-                engine,
-                runtime,
-            ) {
-                return format!("error: action 'edit_bind_chain' failed: {}", ui_error_label(err));
-            }
-
-            return format!(
-                "info: edit -> bind song row {} to chain {}",
-                snapshot.selected_song_row, chain_id
-            );
+            return run_shell_edit_command("c", ui, engine, runtime, history, edit_state);
         }
         "edit_bind_phrase" => {
-            let snapshot = ui.snapshot(engine, runtime);
-            let Some(chain_id) = bound_chain_id(engine.snapshot(), snapshot) else {
-                return String::from("warn: no chain on selected song row; run edit_bind_chain first");
-            };
-            let phrase_id = (snapshot.selected_song_row * CHAIN_VIEW_ROWS + snapshot.selected_chain_row) as u8;
-
-            if let Err(err) = ui.handle_action(UiAction::EnsurePhrase { phrase_id }, engine, runtime) {
-                return format!("error: action 'edit_bind_phrase' failed: {}", ui_error_label(err));
-            }
-            if let Err(err) = ui.handle_action(UiAction::SelectPhrase(phrase_id), engine, runtime) {
-                return format!("error: action 'edit_bind_phrase' failed: {}", ui_error_label(err));
-            }
-            if let Err(err) = ui.handle_action(
-                UiAction::BindChainRowToPhrase {
-                    chain_id,
-                    chain_row: snapshot.selected_chain_row,
-                    phrase_id: Some(phrase_id),
-                    transpose: 0,
-                },
-                engine,
-                runtime,
-            ) {
-                return format!("error: action 'edit_bind_phrase' failed: {}", ui_error_label(err));
-            }
-
-            return format!(
-                "info: edit -> bind chain {} row {} to phrase {}",
-                chain_id, snapshot.selected_chain_row, phrase_id
-            );
+            return run_shell_edit_command("f", ui, engine, runtime, history, edit_state);
         }
         "edit_ensure_instrument" => {
-            let snapshot = ui.snapshot(engine, runtime);
-            let instrument_id = snapshot.focused_track as u8;
-            if let Err(err) = ui.handle_action(
-                UiAction::EnsureInstrument {
-                    instrument_id,
-                    instrument_type: p9_core::model::InstrumentType::Synth,
-                    name: format!("Track {} Synth", snapshot.focused_track),
-                },
-                engine,
-                runtime,
-            ) {
-                return format!(
-                    "error: action 'edit_ensure_instrument' failed: {}",
-                    ui_error_label(err)
-                );
-            }
-
-            return format!("info: edit -> ensure instrument {}", instrument_id);
+            return run_shell_edit_command("i", ui, engine, runtime, history, edit_state);
+        }
+        "edit_select_start" => {
+            return run_shell_edit_command("a", ui, engine, runtime, history, edit_state);
+        }
+        "edit_select_end" => {
+            return run_shell_edit_command("z", ui, engine, runtime, history, edit_state);
+        }
+        "edit_copy" => {
+            return run_shell_edit_command("w", ui, engine, runtime, history, edit_state);
+        }
+        "edit_paste_safe" => {
+            return run_shell_edit_command("v", ui, engine, runtime, history, edit_state);
+        }
+        "edit_paste_force" => {
+            return run_shell_edit_command("V", ui, engine, runtime, history, edit_state);
+        }
+        "edit_clear_selection" => {
+            return run_shell_edit_command("x", ui, engine, runtime, history, edit_state);
+        }
+        "edit_undo" => {
+            return run_shell_edit_command("u", ui, engine, runtime, history, edit_state);
+        }
+        "edit_redo" => {
+            return run_shell_edit_command("y", ui, engine, runtime, history, edit_state);
         }
         "edit_write_step" => {
+            let custom_edit = query_flag(query, "clear")
+                || query_value(query, "note").is_some()
+                || query_value(query, "velocity").is_some()
+                || query_value(query, "instrument").is_some();
+            if !custom_edit {
+                return run_shell_edit_command("e", ui, engine, runtime, history, edit_state);
+            }
+
             let snapshot = ui.snapshot(engine, runtime);
             let focused_instrument = snapshot.focused_track as u8;
             let clear = query_flag(query, "clear");
@@ -549,6 +548,8 @@ fn apply_gui_command_with_query(
                 );
             };
 
+            let before = engine.snapshot().clone();
+
             if let Err(err) = ui.handle_action(UiAction::SelectPhrase(phrase_id), engine, runtime) {
                 return format!("error: action 'edit_write_step' failed: {}", ui_error_label(err));
             }
@@ -562,9 +563,10 @@ fn apply_gui_command_with_query(
                 },
                 engine,
                 runtime,
-            ) {
+                ) {
                 return format!("error: action 'edit_write_step' failed: {}", ui_error_label(err));
             }
+            history.record_change(before);
 
             if clear {
                 return format!(
@@ -605,6 +607,30 @@ fn apply_gui_command_with_query(
     match ui.handle_action(action, engine, runtime) {
         Ok(()) => format!("info: action '{command}' applied"),
         Err(err) => format!("error: action '{command}' failed: {}", ui_error_label(err)),
+    }
+}
+
+fn run_shell_edit_command(
+    command: &str,
+    ui: &mut UiController,
+    engine: &mut Engine,
+    runtime: &mut RuntimeCoordinator,
+    history: &mut ProjectHistory,
+    edit_state: &mut ShellEditState,
+) -> String {
+    match apply_shell_command_with_history_state(command, ui, engine, runtime, history, edit_state) {
+        Ok(ShellCommandResult::Continue(message)) => normalize_status(message),
+        Ok(ShellCommandResult::Exit) => String::from("warn: exit command ignored in gui shell"),
+        Err(err) => format!("error: action '{command}' failed: {}", ui_error_label(err)),
+    }
+}
+
+fn normalize_status(message: String) -> String {
+    if message.starts_with("info:") || message.starts_with("warn:") || message.starts_with("error:")
+    {
+        message
+    } else {
+        format!("info: {message}")
     }
 }
 
@@ -657,7 +683,7 @@ fn build_state_json(
     let phrase_view = build_phrase_view_json(project, ui_snapshot);
     let mixer_view = build_mixer_view_json(project, ui_snapshot);
     let session_json = build_session_json(session_state);
-    let editor_json = build_editor_json(project, ui_snapshot);
+    let editor_json = build_editor_json(project, ui_snapshot, session_state);
 
     format!(
         "{{\"screen\":\"{}\",\"transport\":{{\"tick\":{},\"playing\":{},\"tempo\":{}}},\"cursor\":{{\"track\":{},\"song_row\":{},\"chain_row\":{},\"phrase_id\":{},\"step\":{},\"track_level\":{}}},\"status\":{{\"transport\":\"{}\",\"recovery\":\"{}\",\"dirty\":{},\"autosave\":\"{}\",\"queued_commands\":{},\"processed_commands\":{}}},\"session\":{},\"editor\":{},\"scale_highlight\":\"{:?}\",\"views\":{{\"song\":{},\"chain\":{},\"phrase\":{},\"mixer\":{}}}}}",
@@ -744,19 +770,24 @@ fn build_session_json(session_state: &GuiSessionState) -> String {
     )
 }
 
-fn build_editor_json(project: &ProjectData, snapshot: UiSnapshot) -> String {
+fn build_editor_json(project: &ProjectData, snapshot: UiSnapshot, session_state: &GuiSessionState) -> String {
     let bound_chain = bound_chain_id(project, snapshot);
     let bound_phrase = bound_phrase_id(project, snapshot);
     let focused_instrument = snapshot.focused_track as u8;
     let instrument_ready = project.instruments.contains_key(&focused_instrument);
 
     format!(
-        "{{\"target\":\"{}\",\"focused_instrument\":{},\"instrument_ready\":{},\"bound_chain_id\":{},\"bound_phrase_id\":{}}}",
+        "{{\"target\":\"{}\",\"focused_instrument\":{},\"instrument_ready\":{},\"bound_chain_id\":{},\"bound_phrase_id\":{},\"undo_depth\":{},\"redo_depth\":{},\"selection_active\":{},\"clipboard_ready\":{},\"overwrite_guard\":{}}}",
         json_escape(&editor_target_label(snapshot, bound_chain, bound_phrase)),
         focused_instrument,
         instrument_ready,
         option_u8_json(bound_chain),
         option_u8_json(bound_phrase),
+        session_state.history.undo_depth(),
+        session_state.history.redo_depth(),
+        session_state.edit_state.has_selection(),
+        session_state.edit_state.has_clipboard(),
+        session_state.edit_state.has_overwrite_guard(),
     )
 }
 
@@ -1338,7 +1369,7 @@ footer { margin-top: 12px; color: var(--muted); font-size: 0.85rem; }
         <button onclick="sendCmd('toggle_scale')">Toggle Scale Hint</button>
       </div>
       <div class="small" style="margin-top:10px">
-        Keys: Space/T toggle, G play, S stop, R rewind, arrows or H/J/K/L move, N/P switch screen, C/F/I/E edit flow, Ctrl+S save, Q quit.
+        Keys: Space/T toggle, G play, S stop, R rewind, arrows or H/J/K/L move, N/P switch screen, C/F/I/E edit flow, A/Z select, W/V copy-paste, Shift+V force paste, U/Y undo-redo, Ctrl+S save, Q quit.
       </div>
     </div>
 
@@ -1378,12 +1409,26 @@ footer { margin-top: 12px; color: var(--muted); font-size: 0.85rem; }
     <div class="kv"><span>Edit Target</span><strong id="editor-target">-</strong></div>
     <div class="kv"><span>Bound Chain / Phrase</span><strong id="editor-bindings">-</strong></div>
     <div class="kv"><span>Focused Instrument</span><strong id="editor-instrument">-</strong></div>
+    <div class="kv"><span>History</span><strong id="editor-history">-</strong></div>
+    <div class="kv"><span>Selection / Clipboard</span><strong id="editor-buffer">-</strong></div>
     <div class="controls" style="margin-top:8px">
       <button onclick="sendCmd('edit_bind_chain')">Bind Chain (c)</button>
       <button onclick="sendCmd('edit_bind_phrase')">Bind Phrase (f)</button>
       <button onclick="sendCmd('edit_ensure_instrument')">Ensure Inst (i)</button>
       <button onclick="editWriteStep()">Write Step (e)</button>
       <button onclick="sendCmd('edit_write_step', { clear: 1 })">Clear Step</button>
+    </div>
+    <div class="controls" style="margin-top:8px">
+      <button onclick="sendCmd('edit_select_start')">Select Start (a)</button>
+      <button onclick="sendCmd('edit_select_end')">Select End (z)</button>
+      <button onclick="sendCmd('edit_copy')">Copy (w)</button>
+      <button onclick="sendCmd('edit_paste_safe')">Paste Safe (v)</button>
+      <button onclick="sendCmd('edit_paste_force')">Paste Force (Shift+V)</button>
+      <button onclick="sendCmd('edit_clear_selection')">Clear Sel (x)</button>
+    </div>
+    <div class="controls" style="margin-top:8px">
+      <button onclick="sendCmd('edit_undo')">Undo (u)</button>
+      <button onclick="sendCmd('edit_redo')">Redo (y)</button>
     </div>
     <div class="controls" style="margin-top:8px">
       <input id="edit-note" type="text" placeholder="note 0..127 (empty=seeded)" />
@@ -1448,7 +1493,7 @@ footer { margin-top: 12px; color: var(--muted); font-size: 0.85rem; }
   </section>
 
   <footer>
-    Phase 18.1 goal: GUI step editing parity for c/f/i/e flow with explicit cursor target and safety statuses.
+    Phase 18.2 goal: GUI-native selection, block copy/paste, and undo/redo visibility with safety semantics.
   </footer>
 </main>
 
@@ -1476,6 +1521,12 @@ const keyMap = {
   KeyF: 'edit_bind_phrase',
   KeyI: 'edit_ensure_instrument',
   KeyE: 'edit_write_step',
+  KeyA: 'edit_select_start',
+  KeyZ: 'edit_select_end',
+  KeyW: 'edit_copy',
+  KeyV: 'edit_paste_safe',
+  KeyU: 'edit_undo',
+  KeyY: 'edit_redo',
   KeyQ: 'quit',
 };
 
@@ -1666,6 +1717,8 @@ async function refreshState() {
     document.getElementById('editor-target').textContent = editor.target;
     document.getElementById('editor-bindings').textContent = `${fmtOptional(editor.bound_chain_id, true)} / ${fmtOptional(editor.bound_phrase_id, true)}`;
     document.getElementById('editor-instrument').textContent = `${editor.focused_instrument} (${editor.instrument_ready ? 'ready' : 'missing'})`;
+    document.getElementById('editor-history').textContent = `undo ${editor.undo_depth} / redo ${editor.redo_depth}`;
+    document.getElementById('editor-buffer').textContent = `selection ${editor.selection_active ? 'set' : 'empty'} | clipboard ${editor.clipboard_ready ? 'ready' : 'empty'}${editor.overwrite_guard ? ' | overwrite-guard armed' : ''}`;
 
     renderSong(state.views.song);
     renderChain(state.views.chain);
@@ -1740,6 +1793,12 @@ function initKeyboardRouting() {
       return;
     }
 
+    if (event.shiftKey && event.code === 'KeyV') {
+      event.preventDefault();
+      sendCmd('edit_paste_force');
+      return;
+    }
+
     const cmd = keyMap[event.code];
     if (!cmd) {
       return;
@@ -1770,7 +1829,8 @@ refreshState();
 mod tests {
     use super::{
         apply_gui_command, apply_gui_command_with_query, build_state_json, execute_action_command,
-        parse_request_line, query_value, split_path_and_query, GuiSessionState,
+        parse_request_line, query_value, split_path_and_query, GuiSessionState, ProjectHistory,
+        ShellEditState, GUI_HISTORY_LIMIT,
     };
     use crate::hardening::{DirtyStateTracker, RecoveryStatus};
     use crate::runtime::RuntimeCoordinator;
@@ -1787,6 +1847,8 @@ mod tests {
             autosave_status: String::from("clean"),
             current_project_path: None,
             recent_project_paths: Vec::new(),
+            history: ProjectHistory::with_limit(GUI_HISTORY_LIMIT),
+            edit_state: ShellEditState::default(),
         }
     }
 
@@ -1852,16 +1914,44 @@ mod tests {
         let mut ui = UiController::default();
         let mut engine = Engine::new("gui");
         let mut runtime = RuntimeCoordinator::new(24);
+        let mut history = ProjectHistory::with_limit(GUI_HISTORY_LIMIT);
+        let mut edit_state = ShellEditState::default();
 
-        let c = apply_gui_command("edit_bind_chain", &mut ui, &mut engine, &mut runtime);
-        let f = apply_gui_command("edit_bind_phrase", &mut ui, &mut engine, &mut runtime);
-        let i = apply_gui_command("edit_ensure_instrument", &mut ui, &mut engine, &mut runtime);
+        let c = apply_gui_command_with_query(
+            "edit_bind_chain",
+            None,
+            &mut ui,
+            &mut engine,
+            &mut runtime,
+            &mut history,
+            &mut edit_state,
+        );
+        let f = apply_gui_command_with_query(
+            "edit_bind_phrase",
+            None,
+            &mut ui,
+            &mut engine,
+            &mut runtime,
+            &mut history,
+            &mut edit_state,
+        );
+        let i = apply_gui_command_with_query(
+            "edit_ensure_instrument",
+            None,
+            &mut ui,
+            &mut engine,
+            &mut runtime,
+            &mut history,
+            &mut edit_state,
+        );
         let e = apply_gui_command_with_query(
             "edit_write_step",
             Some("note=72&velocity=101&instrument=0"),
             &mut ui,
             &mut engine,
             &mut runtime,
+            &mut history,
+            &mut edit_state,
         );
 
         assert!(c.starts_with("info:"));
@@ -1877,7 +1967,135 @@ mod tests {
     }
 
     #[test]
-    fn edit_write_step_warns_when_phrase_not_bound() {
+    fn edit_block_ops_and_undo_redo_apply_in_gui_flow() {
+        let mut ui = UiController::default();
+        let mut engine = Engine::new("gui");
+        let mut runtime = RuntimeCoordinator::new(24);
+        let mut history = ProjectHistory::with_limit(GUI_HISTORY_LIMIT);
+        let mut edit_state = ShellEditState::default();
+
+        for command in ["edit_bind_chain", "edit_bind_phrase", "edit_ensure_instrument"] {
+            let status = apply_gui_command_with_query(
+                command,
+                None,
+                &mut ui,
+                &mut engine,
+                &mut runtime,
+                &mut history,
+                &mut edit_state,
+            );
+            assert!(status.starts_with("info:"));
+        }
+
+        let write = apply_gui_command_with_query(
+            "edit_write_step",
+            Some("note=65&velocity=95&instrument=0"),
+            &mut ui,
+            &mut engine,
+            &mut runtime,
+            &mut history,
+            &mut edit_state,
+        );
+        assert!(write.starts_with("info:"));
+
+        let select_start = apply_gui_command_with_query(
+            "edit_select_start",
+            None,
+            &mut ui,
+            &mut engine,
+            &mut runtime,
+            &mut history,
+            &mut edit_state,
+        );
+        let select_end = apply_gui_command_with_query(
+            "edit_select_end",
+            None,
+            &mut ui,
+            &mut engine,
+            &mut runtime,
+            &mut history,
+            &mut edit_state,
+        );
+        let copy = apply_gui_command_with_query(
+            "edit_copy",
+            None,
+            &mut ui,
+            &mut engine,
+            &mut runtime,
+            &mut history,
+            &mut edit_state,
+        );
+
+        assert!(select_start.starts_with("info:"));
+        assert!(select_end.starts_with("info:"));
+        assert!(copy.starts_with("info:"));
+
+        ui.handle_action(UiAction::SelectStep(4), &mut engine, &mut runtime)
+            .unwrap();
+
+        let paste = apply_gui_command_with_query(
+            "edit_paste_safe",
+            None,
+            &mut ui,
+            &mut engine,
+            &mut runtime,
+            &mut history,
+            &mut edit_state,
+        );
+        assert!(paste.starts_with("info:"));
+        assert_eq!(
+            engine
+                .snapshot()
+                .phrases
+                .get(&0)
+                .and_then(|phrase| phrase.steps.get(4))
+                .and_then(|step| step.note),
+            Some(65)
+        );
+
+        let undo = apply_gui_command_with_query(
+            "edit_undo",
+            None,
+            &mut ui,
+            &mut engine,
+            &mut runtime,
+            &mut history,
+            &mut edit_state,
+        );
+        assert!(undo.starts_with("info:"));
+        assert_eq!(
+            engine
+                .snapshot()
+                .phrases
+                .get(&0)
+                .and_then(|phrase| phrase.steps.get(4))
+                .and_then(|step| step.note),
+            None
+        );
+
+        let redo = apply_gui_command_with_query(
+            "edit_redo",
+            None,
+            &mut ui,
+            &mut engine,
+            &mut runtime,
+            &mut history,
+            &mut edit_state,
+        );
+        assert!(redo.starts_with("info:"));
+        assert_eq!(
+            engine
+                .snapshot()
+                .phrases
+                .get(&0)
+                .and_then(|phrase| phrase.steps.get(4))
+                .and_then(|step| step.note),
+            Some(65)
+        );
+    }
+
+    #[test]
+    fn edit_write_step_warns_when_bind_context_missing() {
         let mut ui = UiController::default();
         let mut engine = Engine::new("gui");
         let mut runtime = RuntimeCoordinator::new(24);
@@ -1886,7 +2104,6 @@ mod tests {
         let warn = apply_gui_command("edit_write_step", &mut ui, &mut engine, &mut runtime);
 
         assert!(warn.starts_with("warn:"));
-        assert!(warn.contains("edit_bind_phrase"));
     }
 
     #[test]
@@ -2011,6 +2228,11 @@ mod tests {
         assert!(json.contains("\"status\":{"));
         assert!(json.contains("\"session\":{"));
         assert!(json.contains("\"editor\":{"));
+        assert!(json.contains("\"undo_depth\":"));
+        assert!(json.contains("\"redo_depth\":"));
+        assert!(json.contains("\"selection_active\":"));
+        assert!(json.contains("\"clipboard_ready\":"));
+        assert!(json.contains("\"overwrite_guard\":"));
         assert!(json.contains("\"recovery\":\"clean-start\""));
         assert!(json.contains("\"views\":{"));
         assert!(json.contains("\"song\":{"));

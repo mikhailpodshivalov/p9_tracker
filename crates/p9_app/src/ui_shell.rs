@@ -69,6 +69,14 @@ impl ProjectHistory {
         engine.replace_project(next);
         true
     }
+
+    pub fn undo_depth(&self) -> usize {
+        self.undo_stack.len()
+    }
+
+    pub fn redo_depth(&self) -> usize {
+        self.redo_stack.len()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -126,6 +134,20 @@ pub struct ShellEditState {
     selection: Option<StepSelection>,
     clipboard: Option<StepClipboard>,
     paste_overwrite_guard: Option<PasteOverwriteGuard>,
+}
+
+impl ShellEditState {
+    pub fn has_selection(&self) -> bool {
+        self.selection.is_some()
+    }
+
+    pub fn has_clipboard(&self) -> bool {
+        self.clipboard.is_some()
+    }
+
+    pub fn has_overwrite_guard(&self) -> bool {
+        self.paste_overwrite_guard.is_some()
+    }
 }
 
 pub fn run_interactive_shell(
