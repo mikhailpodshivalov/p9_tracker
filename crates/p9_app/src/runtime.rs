@@ -42,6 +42,13 @@ pub struct TickReport {
     pub audio_active_voices: u32,
     pub audio_max_voices: u32,
     pub audio_voices_stolen_total: u64,
+    pub audio_voice_note_on_total: u64,
+    pub audio_voice_note_off_total: u64,
+    pub audio_voice_note_off_miss_total: u64,
+    pub audio_voice_retrigger_total: u64,
+    pub audio_voice_zero_attack_total: u64,
+    pub audio_voice_short_release_total: u64,
+    pub audio_click_risk_total: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -205,6 +212,13 @@ impl RuntimeCoordinator {
             audio_active_voices: audio_metrics.active_voices,
             audio_max_voices: audio_metrics.max_voices,
             audio_voices_stolen_total: audio_metrics.voices_stolen_total,
+            audio_voice_note_on_total: audio_metrics.voice_note_on_total,
+            audio_voice_note_off_total: audio_metrics.voice_note_off_total,
+            audio_voice_note_off_miss_total: audio_metrics.voice_note_off_miss_total,
+            audio_voice_retrigger_total: audio_metrics.voice_retrigger_total,
+            audio_voice_zero_attack_total: audio_metrics.voice_zero_attack_total,
+            audio_voice_short_release_total: audio_metrics.voice_short_release_total,
+            audio_click_risk_total: audio_metrics.click_risk_total,
         }
     }
 
@@ -519,6 +533,13 @@ mod tests {
         assert_eq!(report.audio_sample_rate_hz, 48_000);
         assert_eq!(report.audio_buffer_size_frames, 256);
         assert_eq!(report.audio_max_voices, 16);
+        assert_eq!(report.audio_voice_note_on_total, 1);
+        assert_eq!(report.audio_voice_note_off_total, 0);
+        assert_eq!(report.audio_voice_note_off_miss_total, 0);
+        assert_eq!(report.audio_voice_retrigger_total, 0);
+        assert_eq!(report.audio_voice_zero_attack_total, 0);
+        assert_eq!(report.audio_voice_short_release_total, 0);
+        assert_eq!(report.audio_click_risk_total, 0);
     }
 
     #[test]

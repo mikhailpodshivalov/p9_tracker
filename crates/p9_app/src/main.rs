@@ -250,6 +250,13 @@ fn main() {
             active_voices: report.audio_active_voices,
             max_voices: report.audio_max_voices,
             voices_stolen_total: report.audio_voices_stolen_total,
+            voice_note_on_total: report.audio_voice_note_on_total,
+            voice_note_off_total: report.audio_voice_note_off_total,
+            voice_note_off_miss_total: report.audio_voice_note_off_miss_total,
+            voice_retrigger_total: report.audio_voice_retrigger_total,
+            voice_zero_attack_total: report.audio_voice_zero_attack_total,
+            voice_short_release_total: report.audio_voice_short_release_total,
+            click_risk_total: report.audio_click_risk_total,
         };
         last_voice_steals = report.audio_voices_stolen_total;
     }
@@ -279,6 +286,13 @@ fn main() {
             active_voices: report.audio_active_voices,
             max_voices: report.audio_max_voices,
             voices_stolen_total: report.audio_voices_stolen_total,
+            voice_note_on_total: report.audio_voice_note_on_total,
+            voice_note_off_total: report.audio_voice_note_off_total,
+            voice_note_off_miss_total: report.audio_voice_note_off_miss_total,
+            voice_retrigger_total: report.audio_voice_retrigger_total,
+            voice_zero_attack_total: report.audio_voice_zero_attack_total,
+            voice_short_release_total: report.audio_voice_short_release_total,
+            click_risk_total: report.audio_click_risk_total,
         };
         last_voice_steals = report.audio_voices_stolen_total;
     }
@@ -318,7 +332,7 @@ fn main() {
         .expect("autosave failed");
 
     println!(
-        "p9_tracker stage18.4 workflow-polish: tempo={}, restored_tempo={}, ticks={}, playing={}, sync_mode={:?}, external_clock_pending={}, events={}, audio_events={}, midi_events={}, midi_clock_events={}, midi_ingested={}, midi_out_messages={}, processed_commands={}, backend={}, fallback={}, callbacks={}, xruns={}, last_callback_us={}, avg_callback_us={}, sample_rate={}, buffer_size={}, active_voices={}, max_voices={}, voice_steals={}, ui_screen={:?}, ui_track={}, ui_song_row={}, ui_chain_row={}, ui_phrase={}, ui_step={}, ui_scale_highlight={:?}, ui_track_level={}, export_ticks={}, export_events={}, export_samples={}, export_peak={}, export_path={}, autosave_written={}, autosave_tick={}, autosave_path={}, ui_shell_mode_supported={}",
+        "p9_tracker stage19.1a voice-click-metrics: tempo={}, restored_tempo={}, ticks={}, playing={}, sync_mode={:?}, external_clock_pending={}, events={}, audio_events={}, midi_events={}, midi_clock_events={}, midi_ingested={}, midi_out_messages={}, processed_commands={}, backend={}, fallback={}, callbacks={}, xruns={}, last_callback_us={}, avg_callback_us={}, sample_rate={}, buffer_size={}, active_voices={}, max_voices={}, voice_steals={}, note_on_total={}, note_off_total={}, note_off_miss_total={}, retrigger_total={}, zero_attack_total={}, short_release_total={}, click_risk_total={}, ui_screen={:?}, ui_track={}, ui_song_row={}, ui_chain_row={}, ui_phrase={}, ui_step={}, ui_scale_highlight={:?}, ui_track_level={}, export_ticks={}, export_events={}, export_samples={}, export_peak={}, export_path={}, autosave_written={}, autosave_tick={}, autosave_path={}, ui_shell_mode_supported={}",
         envelope.project.song.tempo,
         restored.project.song.tempo,
         transport.tick,
@@ -343,6 +357,13 @@ fn main() {
         last_audio_metrics.active_voices,
         last_audio_metrics.max_voices,
         last_voice_steals,
+        last_audio_metrics.voice_note_on_total,
+        last_audio_metrics.voice_note_off_total,
+        last_audio_metrics.voice_note_off_miss_total,
+        last_audio_metrics.voice_retrigger_total,
+        last_audio_metrics.voice_zero_attack_total,
+        last_audio_metrics.voice_short_release_total,
+        last_audio_metrics.click_risk_total,
         ui_snapshot.screen,
         ui_snapshot.focused_track,
         ui_snapshot.selected_song_row,

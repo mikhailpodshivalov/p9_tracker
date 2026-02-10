@@ -13,6 +13,13 @@ pub struct AudioMetrics {
     pub active_voices: u32,
     pub max_voices: u32,
     pub voices_stolen_total: u64,
+    pub voice_note_on_total: u64,
+    pub voice_note_off_total: u64,
+    pub voice_note_off_miss_total: u64,
+    pub voice_retrigger_total: u64,
+    pub voice_zero_attack_total: u64,
+    pub voice_short_release_total: u64,
+    pub click_risk_total: u64,
 }
 
 impl Default for AudioMetrics {
@@ -27,6 +34,13 @@ impl Default for AudioMetrics {
             active_voices: 0,
             max_voices: 0,
             voices_stolen_total: 0,
+            voice_note_on_total: 0,
+            voice_note_off_total: 0,
+            voice_note_off_miss_total: 0,
+            voice_retrigger_total: 0,
+            voice_zero_attack_total: 0,
+            voice_short_release_total: 0,
+            click_risk_total: 0,
         }
     }
 }
@@ -219,6 +233,14 @@ impl AudioBackend for NativeAudioBackend {
         self.metrics.active_voices = self.voices.active_voice_count() as u32;
         self.metrics.max_voices = self.voices.max_voices() as u32;
         self.metrics.voices_stolen_total = self.voices.voices_stolen_total();
+        let lifecycle = self.voices.lifecycle_stats();
+        self.metrics.voice_note_on_total = lifecycle.note_on_total;
+        self.metrics.voice_note_off_total = lifecycle.note_off_total;
+        self.metrics.voice_note_off_miss_total = lifecycle.note_off_miss_total;
+        self.metrics.voice_retrigger_total = lifecycle.retrigger_total;
+        self.metrics.voice_zero_attack_total = lifecycle.zero_attack_total;
+        self.metrics.voice_short_release_total = lifecycle.short_release_total;
+        self.metrics.click_risk_total = lifecycle.click_risk_total;
     }
 
     fn events_consumed(&self) -> usize {
@@ -314,6 +336,9 @@ mod tests {
         assert_eq!(metrics.avg_callback_us, 250);
         assert_eq!(metrics.active_voices, 1);
         assert_eq!(metrics.max_voices, 16);
+        assert_eq!(metrics.voice_note_on_total, 1);
+        assert_eq!(metrics.voice_note_off_total, 0);
+        assert_eq!(metrics.click_risk_total, 0);
     }
 
     #[test]
@@ -344,5 +369,52 @@ mod tests {
         assert_eq!(metrics.max_voices, 2);
         assert_eq!(metrics.active_voices, 2);
         assert_eq!(metrics.voices_stolen_total, 1);
+        assert_eq!(metrics.click_risk_total, 1);
+        assert_eq!(metrics.voice_note_on_total, 3);
+        assert_eq!(metrics.voice_retrigger_total, 0);
+    }
+
+    #[test]
+    fn lifecycle_metrics_surface_retrigger_and_short_release() {
+        let mut backend = NativeAudioBackend::new(AudioBackendConfig::default());
+        backend.start_checked().unwrap();
+
+        backend.push_events(&[RenderEvent::NoteOn {
+            track_id: 0,
+            note: 60,
+            velocity: 100,
+            instrument_id: Some(0),
+            waveform: SynthWaveform::Saw,
+            attack_ms: 0,
+            release_ms: 1,
+            gain: 100,
+        }]);
+        backend.push_events(&[RenderEvent::NoteOn {
+            track_id: 0,
+            note: 60,
+            velocity: 100,
+            instrument_id: Some(0),
+            waveform: SynthWaveform::Saw,
+            attack_ms: 4,
+            release_ms: 1,
+            gain: 100,
+        }]);
+        backend.push_events(&[RenderEvent::NoteOff {
+            track_id: 0,
+            note: 60,
+        }]);
+        backend.push_events(&[RenderEvent::NoteOff {
+            track_id: 0,
+            note: 61,
+        }]);
+
+        let metrics = backend.metrics();
+        assert_eq!(metrics.voice_note_on_total, 2);
+        assert_eq!(metrics.voice_note_off_total, 2);
+        assert_eq!(metrics.voice_note_off_miss_total, 1);
+        assert_eq!(metrics.voice_retrigger_total, 1);
+        assert_eq!(metrics.voice_zero_attack_total, 1);
+        assert_eq!(metrics.voice_short_release_total, 1);
+        assert_eq!(metrics.click_risk_total, 3);
     }
 }

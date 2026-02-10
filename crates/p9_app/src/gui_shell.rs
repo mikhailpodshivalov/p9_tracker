@@ -96,7 +96,7 @@ pub fn run_web_shell(
     listener.set_nonblocking(true)?;
 
     println!(
-        "p9_tracker gui-shell stage18.4 running at http://{}",
+        "p9_tracker gui-shell stage19.1a running at http://{}",
         listener.local_addr()?
     );
     println!("Open this URL in browser. Press Ctrl+C or click Quit GUI Shell to stop.");
@@ -1953,8 +1953,8 @@ footer { margin-top: 12px; color: var(--muted); font-size: 0.85rem; }
 <body>
 <main>
   <header>
-    <h1>P9 Tracker GUI Shell (Phase 18.4)</h1>
-    <span class="small">workflow polish: quick focus transitions, direct screen jumps, clearer feedback</span>
+    <h1>P9 Tracker GUI Shell (Phase 19.1a)</h1>
+    <span class="small">workflow polish + voice lifecycle/click-risk telemetry baseline</span>
   </header>
 
   <section class="panel">
@@ -2149,7 +2149,7 @@ footer { margin-top: 12px; color: var(--muted); font-size: 0.85rem; }
   </section>
 
   <footer>
-    Phase 18.4 goal: polish editing workflow with faster focus, clearer guidance, and GUI interaction regressions.
+    Phase 19.1a goal: establish voice lifecycle + click-risk metrics baseline while keeping polished GUI workflow.
   </footer>
 </main>
 

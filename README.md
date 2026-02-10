@@ -2,7 +2,7 @@
 
 ## Status
 
-- Current stage: `Phase 18.4 workflow polish completed`
+- Current stage: `Phase 19.1a voice lifecycle/click metrics baseline completed`
 - Main implementation stack: `Rust`
 
 ## Phase 1 Artifacts
@@ -121,6 +121,10 @@
 ## Phase 18.4 Artifacts
 
 - `docs/phase18_4_workflow_polish.md`
+
+## Phase 19.1a Artifacts
+
+- `docs/phase19_1a_voice_click_metrics.md`
 
 ## Forward Plan
 
