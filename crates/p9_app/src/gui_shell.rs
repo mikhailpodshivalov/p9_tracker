@@ -96,7 +96,7 @@ pub fn run_web_shell(
     listener.set_nonblocking(true)?;
 
     println!(
-        "p9_tracker gui-shell stage18.3 running at http://{}",
+        "p9_tracker gui-shell stage18.4 running at http://{}",
         listener.local_addr()?
     );
     println!("Open this URL in browser. Press Ctrl+C or click Quit GUI Shell to stop.");
@@ -474,6 +474,27 @@ fn apply_gui_command_with_query(
             runtime.enqueue_command(RuntimeCommand::Stop);
             return String::from("info: transport stop queued");
         }
+        "screen_song" => {
+            return apply_screen_target(UiScreen::Song, ui, engine, runtime);
+        }
+        "screen_chain" => {
+            return apply_screen_target(UiScreen::Chain, ui, engine, runtime);
+        }
+        "screen_phrase" => {
+            return apply_screen_target(UiScreen::Phrase, ui, engine, runtime);
+        }
+        "screen_mixer" => {
+            return apply_screen_target(UiScreen::Mixer, ui, engine, runtime);
+        }
+        "step_prev_fine" => {
+            return apply_phrase_step_shift(-1, ui, engine, runtime);
+        }
+        "step_next_fine" => {
+            return apply_phrase_step_shift(1, ui, engine, runtime);
+        }
+        "edit_focus_prepare" => {
+            return apply_edit_focus_prepare(ui, engine, runtime, history, edit_state);
+        }
         "edit_bind_chain" => {
             return run_shell_edit_command("c", ui, engine, runtime, history, edit_state);
         }
@@ -677,7 +698,9 @@ fn apply_gui_command_with_query(
     };
 
     let Some(action) = action else {
-        return format!("warn: unknown action '{command}'");
+        return polish_status_for_gui(format!(
+            "warn: unknown action '{command}'; use visible buttons or keyboard shortcuts"
+        ));
     };
 
     match ui.handle_action(action, engine, runtime) {
@@ -699,6 +722,96 @@ fn run_shell_edit_command(
         Ok(ShellCommandResult::Exit) => String::from("warn: exit command ignored in gui shell"),
         Err(err) => format!("error: action '{command}' failed: {}", ui_error_label(err)),
     }
+}
+
+fn apply_screen_target(
+    target: UiScreen,
+    ui: &mut UiController,
+    engine: &mut Engine,
+    runtime: &mut RuntimeCoordinator,
+) -> String {
+    for _ in 0..4 {
+        let snapshot = ui.snapshot(engine, runtime);
+        if snapshot.screen == target {
+            return format!("info: screen -> {}", ui_screen_tab_label(target));
+        }
+        if let Err(err) = ui.handle_action(UiAction::NextScreen, engine, runtime) {
+            return format!("error: action 'screen' failed: {}", ui_error_label(err));
+        }
+    }
+
+    format!(
+        "error: action 'screen' failed: unable to reach target {}",
+        ui_screen_tab_label(target)
+    )
+}
+
+fn apply_phrase_step_shift(
+    delta: i8,
+    ui: &mut UiController,
+    engine: &mut Engine,
+    runtime: &mut RuntimeCoordinator,
+) -> String {
+    let snapshot = ui.snapshot(engine, runtime);
+    let next = if delta >= 0 {
+        (snapshot.selected_step + 1) % PHRASE_STEP_COUNT
+    } else {
+        (snapshot.selected_step + PHRASE_STEP_COUNT - 1) % PHRASE_STEP_COUNT
+    };
+
+    match ui.handle_action(UiAction::SelectStep(next), engine, runtime) {
+        Ok(()) => format!("info: cursor -> step {:02}", next),
+        Err(err) => format!("error: action 'step_shift' failed: {}", ui_error_label(err)),
+    }
+}
+
+fn apply_edit_focus_prepare(
+    ui: &mut UiController,
+    engine: &mut Engine,
+    runtime: &mut RuntimeCoordinator,
+    history: &mut ProjectHistory,
+    edit_state: &mut ShellEditState,
+) -> String {
+    let mut snapshot = ui.snapshot(engine, runtime);
+
+    if bound_chain_id(engine.snapshot(), snapshot).is_none() {
+        let status = run_shell_edit_command("c", ui, engine, runtime, history, edit_state);
+        if !status.starts_with("info:") {
+            return status;
+        }
+        snapshot = ui.snapshot(engine, runtime);
+    }
+
+    if bound_phrase_id(engine.snapshot(), snapshot).is_none() {
+        let status = run_shell_edit_command("f", ui, engine, runtime, history, edit_state);
+        if !status.starts_with("info:") {
+            return status;
+        }
+        snapshot = ui.snapshot(engine, runtime);
+    }
+
+    let instrument_id = snapshot.focused_track as u8;
+    if !engine.snapshot().instruments.contains_key(&instrument_id) {
+        let status = run_shell_edit_command("i", ui, engine, runtime, history, edit_state);
+        if !status.starts_with("info:") {
+            return status;
+        }
+    }
+
+    let screen_status = apply_screen_target(UiScreen::Phrase, ui, engine, runtime);
+    if !screen_status.starts_with("info:") {
+        return screen_status;
+    }
+
+    snapshot = ui.snapshot(engine, runtime);
+    let chain = bound_chain_id(engine.snapshot(), snapshot);
+    let phrase = bound_phrase_id(engine.snapshot(), snapshot);
+    format!(
+        "info: focus -> phrase editor ready (chain {} phrase {} ins {:02})",
+        option_u8_label(chain),
+        option_u8_label(phrase),
+        instrument_id
+    )
 }
 
 fn apply_power_duplicate(
@@ -1038,12 +1151,35 @@ fn apply_chain_clone_prev(
 }
 
 fn normalize_status(message: String) -> String {
-    if message.starts_with("info:") || message.starts_with("warn:") || message.starts_with("error:")
-    {
-        message
-    } else {
-        format!("info: {message}")
+    let normalized =
+        if message.starts_with("info:") || message.starts_with("warn:") || message.starts_with("error:")
+        {
+            message
+        } else {
+            format!("info: {message}")
+        };
+    polish_status_for_gui(normalized)
+}
+
+fn polish_status_for_gui(message: String) -> String {
+    let mut polished = message;
+    let replacements = [
+        ("run c first", "click Bind Chain (c) first"),
+        ("run f first", "click Bind Phrase (f) first"),
+        ("run i first", "click Ensure Inst (i) first"),
+        ("run a first", "click Select Start (a) first"),
+        ("run w first", "click Copy (w) first"),
+        ("run v first", "click Paste Safe (v) first"),
+        (
+            "run V to confirm overwrite",
+            "press Paste Force (Shift+V) to confirm overwrite",
+        ),
+    ];
+    for (from, to) in replacements {
+        polished = polished.replace(from, to);
     }
+
+    polished
 }
 
 fn cursor_down_action(snapshot: UiSnapshot) -> UiAction {
@@ -1077,6 +1213,15 @@ fn cursor_up_action(snapshot: UiSnapshot) -> UiAction {
             UiAction::SelectStep((snapshot.selected_step + PHRASE_STEP_COUNT - 4) % PHRASE_STEP_COUNT)
         }
         UiScreen::Mixer => UiAction::FocusTrackLeft,
+    }
+}
+
+fn ui_screen_tab_label(screen: UiScreen) -> &'static str {
+    match screen {
+        UiScreen::Song => "SONG",
+        UiScreen::Chain => "CHAIN",
+        UiScreen::Phrase => "PHRASE",
+        UiScreen::Mixer => "MIXER",
     }
 }
 
@@ -1808,8 +1953,8 @@ footer { margin-top: 12px; color: var(--muted); font-size: 0.85rem; }
 <body>
 <main>
   <header>
-    <h1>P9 Tracker GUI Shell (Phase 18.3)</h1>
-    <span class="small">power tools v1: duplicate/fill/clear/transpose/rotate + row clone helpers</span>
+    <h1>P9 Tracker GUI Shell (Phase 18.4)</h1>
+    <span class="small">workflow polish: quick focus transitions, direct screen jumps, clearer feedback</span>
   </header>
 
   <section class="panel">
@@ -1845,8 +1990,19 @@ footer { margin-top: 12px; color: var(--muted); font-size: 0.85rem; }
       <div class="controls" style="margin-top:8px">
         <button onclick="sendCmd('toggle_scale')">Toggle Scale Hint</button>
       </div>
+      <div class="controls" style="margin-top:8px">
+        <button onclick="sendCmd('screen_song')">Song (1)</button>
+        <button onclick="sendCmd('screen_chain')">Chain (2)</button>
+        <button onclick="sendCmd('screen_phrase')">Phrase (3)</button>
+        <button onclick="sendCmd('screen_mixer')">Mixer (4)</button>
+      </div>
+      <div class="controls" style="margin-top:8px">
+        <button onclick="sendCmd('edit_focus_prepare')">Focus Editor (/)</button>
+        <button onclick="sendCmd('step_prev_fine')">Step -1 (PgUp)</button>
+        <button onclick="sendCmd('step_next_fine')">Step +1 (PgDn)</button>
+      </div>
       <div class="small" style="margin-top:10px">
-        Keys: Space/T toggle, G play, S stop, R rewind, arrows or H/J/K/L move, N/P switch screen, C/F/I/E edit flow, A/Z select, W/V copy-paste, Shift+V force paste, D duplicate, B fill, M clear block, [/] transpose, ,/. rotate, U/Y undo-redo, Ctrl+S save, Q quit.
+        Keys: Space/T toggle, G play, S stop, R rewind, arrows or H/J/K/L move, N/P switch screen, 1/2/3/4 direct screens, / quick editor focus, PgUp/PgDn step -/+1, C/F/I/E edit flow, A/Z select, W/V copy-paste, Shift+V force paste, D duplicate, B fill, M clear block, [/] transpose, ,/. rotate, U/Y undo-redo, Ctrl+S save, Q quit.
       </div>
     </div>
 
@@ -1993,7 +2149,7 @@ footer { margin-top: 12px; color: var(--muted); font-size: 0.85rem; }
   </section>
 
   <footer>
-    Phase 18.3 goal: power editing tools for repetitive authoring with deterministic safety semantics.
+    Phase 18.4 goal: polish editing workflow with faster focus, clearer guidance, and GUI interaction regressions.
   </footer>
 </main>
 
@@ -2006,6 +2162,10 @@ const keyMap = {
   KeyG: 'play',
   KeyS: 'stop',
   KeyR: 'rewind',
+  Digit1: 'screen_song',
+  Digit2: 'screen_chain',
+  Digit3: 'screen_phrase',
+  Digit4: 'screen_mixer',
   ArrowLeft: 'track_left',
   ArrowRight: 'track_right',
   ArrowUp: 'cursor_up',
@@ -2034,6 +2194,9 @@ const keyMap = {
   BracketRight: 'edit_power_transpose_up',
   Comma: 'edit_power_rotate_left',
   Period: 'edit_power_rotate_right',
+  Slash: 'edit_focus_prepare',
+  PageUp: 'step_prev_fine',
+  PageDown: 'step_next_fine',
   KeyQ: 'quit',
 };
 
@@ -2380,7 +2543,7 @@ mod tests {
     };
     use crate::hardening::{DirtyStateTracker, RecoveryStatus};
     use crate::runtime::RuntimeCoordinator;
-    use crate::ui::{UiAction, UiController};
+    use crate::ui::{UiAction, UiController, UiScreen};
     use p9_core::engine::Engine;
     use std::fs;
     use std::path::PathBuf;
@@ -2439,6 +2602,7 @@ mod tests {
 
         let unknown = apply_gui_command("nope", &mut ui, &mut engine, &mut runtime);
         assert!(unknown.starts_with("warn:"));
+        assert!(unknown.contains("visible buttons"));
     }
 
     #[test]
@@ -2453,6 +2617,27 @@ mod tests {
         assert!(play.contains("queued"));
         assert!(stop.contains("queued"));
         assert_eq!(runtime.snapshot().queued_commands, 2);
+    }
+
+    #[test]
+    fn screen_shortcuts_and_fine_step_shift_work() {
+        let mut ui = UiController::default();
+        let mut engine = Engine::new("gui");
+        let mut runtime = RuntimeCoordinator::new(24);
+
+        let to_mixer = apply_gui_command("screen_mixer", &mut ui, &mut engine, &mut runtime);
+        let to_phrase = apply_gui_command("screen_phrase", &mut ui, &mut engine, &mut runtime);
+        assert!(to_mixer.starts_with("info:"));
+        assert!(to_phrase.starts_with("info:"));
+        assert_eq!(ui.snapshot(&engine, &runtime).screen, UiScreen::Phrase);
+
+        let prev = apply_gui_command("step_prev_fine", &mut ui, &mut engine, &mut runtime);
+        assert!(prev.starts_with("info:"));
+        assert_eq!(ui.snapshot(&engine, &runtime).selected_step, 15);
+
+        let next = apply_gui_command("step_next_fine", &mut ui, &mut engine, &mut runtime);
+        assert!(next.starts_with("info:"));
+        assert_eq!(ui.snapshot(&engine, &runtime).selected_step, 0);
     }
 
     #[test]
@@ -2510,6 +2695,74 @@ mod tests {
         assert_eq!(step.note, Some(72));
         assert_eq!(step.velocity, 101);
         assert_eq!(step.instrument_id, Some(0));
+    }
+
+    #[test]
+    fn edit_focus_prepare_bootstraps_editor_context() {
+        let mut ui = UiController::default();
+        let mut engine = Engine::new("gui");
+        let mut runtime = RuntimeCoordinator::new(24);
+        let mut history = ProjectHistory::with_limit(GUI_HISTORY_LIMIT);
+        let mut edit_state = ShellEditState::default();
+
+        let status = apply_gui_command_with_query(
+            "edit_focus_prepare",
+            None,
+            &mut ui,
+            &mut engine,
+            &mut runtime,
+            &mut history,
+            &mut edit_state,
+        );
+        assert!(status.starts_with("info:"));
+        assert!(status.contains("phrase editor ready"));
+
+        let snapshot = ui.snapshot(&engine, &runtime);
+        assert_eq!(snapshot.screen, UiScreen::Phrase);
+        assert_eq!(
+            engine
+                .snapshot()
+                .song
+                .tracks
+                .get(0)
+                .unwrap()
+                .song_rows
+                .get(0)
+                .copied()
+                .flatten(),
+            Some(0)
+        );
+        assert_eq!(
+            engine
+                .snapshot()
+                .chains
+                .get(&0)
+                .and_then(|chain| chain.rows.get(0))
+                .and_then(|row| row.phrase_id),
+            Some(0)
+        );
+        assert!(engine.snapshot().instruments.contains_key(&0));
+    }
+
+    #[test]
+    fn polished_warnings_include_actionable_shortcuts() {
+        let mut ui = UiController::default();
+        let mut engine = Engine::new("gui");
+        let mut runtime = RuntimeCoordinator::new(24);
+        let mut history = ProjectHistory::with_limit(GUI_HISTORY_LIMIT);
+        let mut edit_state = ShellEditState::default();
+
+        let warn = apply_gui_command_with_query(
+            "edit_paste_force",
+            None,
+            &mut ui,
+            &mut engine,
+            &mut runtime,
+            &mut history,
+            &mut edit_state,
+        );
+        assert!(warn.starts_with("warn:"));
+        assert!(warn.contains("Bind Chain (c)"));
     }
 
     #[test]

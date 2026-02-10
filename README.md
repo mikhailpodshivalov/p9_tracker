@@ -2,7 +2,7 @@
 
 ## Status
 
-- Current stage: `Phase 18.3 power tools v1 completed`
+- Current stage: `Phase 18.4 workflow polish completed`
 - Main implementation stack: `Rust`
 
 ## Phase 1 Artifacts
@@ -117,6 +117,10 @@
 ## Phase 18.3 Artifacts
 
 - `docs/phase18_3_power_tools_v1.md`
+
+## Phase 18.4 Artifacts
+
+- `docs/phase18_4_workflow_polish.md`
 
 ## Forward Plan
 
