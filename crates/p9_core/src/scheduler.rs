@@ -1,5 +1,5 @@
 use crate::engine::Engine;
-use crate::events::RenderEvent;
+use crate::events::{RenderEvent, RenderMode};
 use crate::model::{
     ChainId, FxCommand, InstrumentId, InstrumentType, ProjectData, Scale, SynthParams,
     PHRASE_STEP_COUNT, SONG_ROW_COUNT, TRACK_COUNT,
@@ -20,6 +20,7 @@ struct StepPlaybackData {
     track_id: u8,
     note: u8,
     velocity: u8,
+    render_mode: RenderMode,
     instrument_id: Option<InstrumentId>,
     note_length_steps: u8,
     synth_params: SynthParams,
@@ -29,6 +30,7 @@ struct StepPlaybackData {
 struct InstrumentPlaybackProfile {
     note_length_steps: u8,
     synth_params: SynthParams,
+    render_mode: RenderMode,
 }
 
 pub struct Scheduler {
@@ -140,6 +142,7 @@ impl Scheduler {
             track_id: step_data.track_id,
             note: step_data.note,
             velocity: step_data.velocity,
+            render_mode: step_data.render_mode,
             instrument_id: step_data.instrument_id,
             waveform: step_data.synth_params.waveform,
             attack_ms: step_data.synth_params.attack_ms,
@@ -219,6 +222,7 @@ impl Scheduler {
         let mut note_i16 = base_note as i16;
         let mut velocity = step.velocity;
         let profile = self.resolve_instrument_profile(project, step.instrument_id);
+        let render_mode = profile.render_mode;
         let mut note_length_steps = profile.note_length_steps;
         let synth_params = profile.synth_params;
 
@@ -254,6 +258,7 @@ impl Scheduler {
             track_id: track.index,
             note,
             velocity,
+            render_mode,
             instrument_id: step.instrument_id,
             note_length_steps,
             synth_params,
@@ -269,11 +274,17 @@ impl Scheduler {
             return InstrumentPlaybackProfile {
                 note_length_steps: 1,
                 synth_params: SynthParams::default(),
+                render_mode: RenderMode::Synth,
             };
         };
 
         let mut note_length_steps = instrument.note_length_steps.max(1);
         let mut synth_params = instrument.synth_params;
+        let render_mode = match instrument.instrument_type {
+            InstrumentType::Synth | InstrumentType::None => RenderMode::Synth,
+            InstrumentType::Sampler => RenderMode::SamplerV1,
+            InstrumentType::MidiOut | InstrumentType::External => RenderMode::ExternalMuted,
+        };
 
         match instrument.instrument_type {
             InstrumentType::Synth => {}
@@ -298,6 +309,7 @@ impl Scheduler {
         InstrumentPlaybackProfile {
             note_length_steps,
             synth_params,
+            render_mode,
         }
     }
 
@@ -536,7 +548,7 @@ impl Scheduler {
 mod tests {
     use super::Scheduler;
     use crate::engine::{Engine, EngineCommand};
-    use crate::events::RenderEvent;
+    use crate::events::{RenderEvent, RenderMode};
     use crate::model::{Chain, FxCommand, Groove, Instrument, InstrumentType, Phrase, Scale, Table};
 
     fn setup_engine() -> Engine {
@@ -1009,18 +1021,20 @@ mod tests {
             .iter()
             .find_map(|event| match event {
                 RenderEvent::NoteOn {
+                    render_mode,
                     attack_ms,
                     release_ms,
                     gain,
                     ..
-                } => Some((*attack_ms, *release_ms, *gain)),
+                } => Some((*render_mode, *attack_ms, *release_ms, *gain)),
                 _ => None,
             })
             .expect("expected sampler note on");
 
-        assert_eq!(note_on.0, 1);
-        assert_eq!(note_on.1, 24);
-        assert_eq!(note_on.2, 96);
+        assert_eq!(note_on.0, RenderMode::SamplerV1);
+        assert_eq!(note_on.1, 1);
+        assert_eq!(note_on.2, 24);
+        assert_eq!(note_on.3, 96);
         assert_eq!(count_note_off(&t2), 0);
         assert_eq!(count_note_off(&t3), 1);
     }
@@ -1055,18 +1069,20 @@ mod tests {
             .iter()
             .find_map(|event| match event {
                 RenderEvent::NoteOn {
+                    render_mode,
                     attack_ms,
                     release_ms,
                     gain,
                     ..
-                } => Some((*attack_ms, *release_ms, *gain)),
+                } => Some((*render_mode, *attack_ms, *release_ms, *gain)),
                 _ => None,
             })
             .expect("expected midi out note on");
 
-        assert_eq!(note_on.0, 1);
-        assert_eq!(note_on.1, 16);
-        assert_eq!(note_on.2, 0);
+        assert_eq!(note_on.0, RenderMode::ExternalMuted);
+        assert_eq!(note_on.1, 1);
+        assert_eq!(note_on.2, 16);
+        assert_eq!(note_on.3, 0);
     }
 
     fn count_note_on(events: &[RenderEvent]) -> usize {

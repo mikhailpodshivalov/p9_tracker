@@ -180,7 +180,7 @@ mod tests {
         decode_message, forward_render_events, render_event_to_midi, BufferedMidiInput,
         BufferedMidiOutput, DecodedMidi, MidiInput, MidiMessage, MidiOutput, NoopMidiOutput,
     };
-    use p9_core::events::RenderEvent;
+    use p9_core::events::{RenderEvent, RenderMode};
     use p9_core::model::SynthWaveform;
 
     fn note_on(track_id: u8, note: u8, velocity: u8) -> RenderEvent {
@@ -188,6 +188,7 @@ mod tests {
             track_id,
             note,
             velocity,
+            render_mode: RenderMode::Synth,
             instrument_id: Some(0),
             waveform: SynthWaveform::Saw,
             attack_ms: 5,

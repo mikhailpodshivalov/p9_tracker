@@ -2,7 +2,7 @@
 
 ## Status
 
-- Current stage: `Phase 19.2b sampler export/runtime consistency increment completed`
+- Current stage: `Phase 19.2c explicit render-mode tagging completed`
 - Main implementation stack: `Rust`
 
 ## Phase 1 Artifacts
@@ -141,6 +141,10 @@
 ## Phase 19.2b Artifacts
 
 - `docs/phase19_2b_sampler_export_runtime.md`
+
+## Phase 19.2c Artifacts
+
+- `docs/phase19_2c_render_mode_tagging.md`
 
 ## Forward Plan
 

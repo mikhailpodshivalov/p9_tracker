@@ -96,7 +96,7 @@ pub fn run_web_shell(
     listener.set_nonblocking(true)?;
 
     println!(
-        "p9_tracker gui-shell stage19.2b running at http://{}",
+        "p9_tracker gui-shell stage19.2c running at http://{}",
         listener.local_addr()?
     );
     println!("Open this URL in browser. Press Ctrl+C or click Quit GUI Shell to stop.");
@@ -1953,7 +1953,7 @@ footer { margin-top: 12px; color: var(--muted); font-size: 0.85rem; }
 <body>
 <main>
   <header>
-    <h1>P9 Tracker GUI Shell (Phase 19.2b)</h1>
+    <h1>P9 Tracker GUI Shell (Phase 19.2c)</h1>
     <span class="small">workflow polish + voice lifecycle/click-risk telemetry baseline</span>
   </header>
 
@@ -2149,7 +2149,7 @@ footer { margin-top: 12px; color: var(--muted); font-size: 0.85rem; }
   </section>
 
   <footer>
-    Phase 19.2b goal: sampler-v1 export detail and runtime consistency for zero-gain external profiles.
+    Phase 19.2c goal: explicit render-mode tags across scheduler, runtime, and export.
   </footer>
 </main>
 

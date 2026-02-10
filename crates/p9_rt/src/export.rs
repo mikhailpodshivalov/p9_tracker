@@ -4,7 +4,7 @@ use std::io::{self, Write};
 use std::path::Path;
 
 use p9_core::engine::Engine;
-use p9_core::events::RenderEvent;
+use p9_core::events::{RenderEvent, RenderMode};
 use p9_core::model::SynthWaveform;
 use p9_core::scheduler::Scheduler;
 
@@ -141,6 +141,7 @@ fn apply_event(voices: &mut Vec<ActiveVoice>, event: &RenderEvent, sample_rate_h
             track_id,
             note,
             velocity,
+            render_mode,
             waveform,
             attack_ms,
             release_ms,
@@ -149,7 +150,7 @@ fn apply_event(voices: &mut Vec<ActiveVoice>, event: &RenderEvent, sample_rate_h
         } => {
             voices.retain(|voice| !(voice.track_id == *track_id && voice.note == *note));
 
-            if *gain == 0 {
+            if *gain == 0 || matches!(render_mode, RenderMode::ExternalMuted) {
                 return;
             }
 
@@ -157,10 +158,9 @@ fn apply_event(voices: &mut Vec<ActiveVoice>, event: &RenderEvent, sample_rate_h
             let phase_inc = TAU * (freq_hz / sample_rate_hz.max(1.0));
             let velocity_gain = *velocity as f32 / 127.0;
             let instrument_gain = *gain as f32 / 127.0;
-            let mode = if *attack_ms <= 1 && *release_ms >= 24 {
-                VoiceRenderMode::SamplerV1
-            } else {
-                VoiceRenderMode::Standard
+            let mode = match render_mode {
+                RenderMode::SamplerV1 => VoiceRenderMode::SamplerV1,
+                RenderMode::Synth | RenderMode::ExternalMuted => VoiceRenderMode::Standard,
             };
             let mode_gain = match mode {
                 VoiceRenderMode::Standard => 0.22,
@@ -325,8 +325,9 @@ fn write_wav_mono_i16(path: &Path, sample_rate_hz: u32, samples: &[i16]) -> Resu
 
 #[cfg(test)]
 mod tests {
-    use super::{render_project_to_wav, OfflineRenderConfig};
+    use super::{apply_event, render_project_to_wav, synthesize_sample, OfflineRenderConfig};
     use p9_core::engine::{Engine, EngineCommand};
+    use p9_core::events::{RenderEvent, RenderMode};
     use p9_core::model::{Chain, Instrument, InstrumentType, Phrase};
     use std::fs;
     use std::path::PathBuf;
@@ -524,5 +525,70 @@ mod tests {
 
         let _ = fs::remove_file(synth_path);
         let _ = fs::remove_file(sampler_path);
+    }
+
+    #[test]
+    fn external_render_mode_mutes_even_with_nonzero_gain() {
+        let mut voices = Vec::new();
+        let event = RenderEvent::NoteOn {
+            track_id: 0,
+            note: 60,
+            velocity: 110,
+            render_mode: RenderMode::ExternalMuted,
+            instrument_id: Some(0),
+            waveform: p9_core::model::SynthWaveform::Saw,
+            attack_ms: 5,
+            release_ms: 80,
+            gain: 100,
+        };
+
+        apply_event(&mut voices, &event, 48_000.0);
+        let sample = synthesize_sample(&mut voices);
+
+        assert!(voices.is_empty());
+        assert_eq!(sample, 0.0);
+    }
+
+    #[test]
+    fn sampler_render_mode_is_not_heuristic() {
+        let mut synth_voices = Vec::new();
+        let mut sampler_voices = Vec::new();
+
+        let synth_event = RenderEvent::NoteOn {
+            track_id: 0,
+            note: 60,
+            velocity: 100,
+            render_mode: RenderMode::Synth,
+            instrument_id: Some(0),
+            waveform: p9_core::model::SynthWaveform::Saw,
+            attack_ms: 9,
+            release_ms: 9,
+            gain: 100,
+        };
+        let sampler_event = RenderEvent::NoteOn {
+            track_id: 0,
+            note: 60,
+            velocity: 100,
+            render_mode: RenderMode::SamplerV1,
+            instrument_id: Some(0),
+            waveform: p9_core::model::SynthWaveform::Saw,
+            attack_ms: 9,
+            release_ms: 9,
+            gain: 100,
+        };
+
+        apply_event(&mut synth_voices, &synth_event, 48_000.0);
+        apply_event(&mut sampler_voices, &sampler_event, 48_000.0);
+
+        let mut synth_energy = 0.0f32;
+        let mut sampler_energy = 0.0f32;
+        for _ in 0..32 {
+            synth_energy += synthesize_sample(&mut synth_voices).abs();
+            sampler_energy += synthesize_sample(&mut sampler_voices).abs();
+        }
+
+        assert!(!synth_voices.is_empty());
+        assert!(!sampler_voices.is_empty());
+        assert_ne!(synth_energy, sampler_energy);
     }
 }

@@ -1,11 +1,19 @@
 use crate::model::{InstrumentId, SynthWaveform};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RenderMode {
+    Synth,
+    SamplerV1,
+    ExternalMuted,
+}
+
 #[derive(Clone, Debug)]
 pub enum RenderEvent {
     NoteOn {
         track_id: u8,
         note: u8,
         velocity: u8,
+        render_mode: RenderMode,
         instrument_id: Option<InstrumentId>,
         waveform: SynthWaveform,
         attack_ms: u16,
