@@ -2,7 +2,7 @@
 
 ## Status
 
-- Current stage: `Phase 19.2d sampler render variants completed`
+- Current stage: `Phase 19.3a FX routing contracts completed`
 - Main implementation stack: `Rust`
 
 ## Phase 1 Artifacts
@@ -149,6 +149,10 @@
 ## Phase 19.2d Artifacts
 
 - `docs/phase19_2d_sampler_render_variants.md`
+
+## Phase 19.3a Artifacts
+
+- `docs/phase19_3a_fx_routing_contracts.md`
 
 ## Forward Plan
 

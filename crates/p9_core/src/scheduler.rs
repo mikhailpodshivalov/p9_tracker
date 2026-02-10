@@ -21,6 +21,11 @@ struct StepPlaybackData {
     note: u8,
     velocity: u8,
     render_mode: RenderMode,
+    track_level: u8,
+    master_level: u8,
+    send_mfx: u8,
+    send_delay: u8,
+    send_reverb: u8,
     sampler_render: SamplerRenderParams,
     instrument_id: Option<InstrumentId>,
     note_length_steps: u8,
@@ -145,6 +150,11 @@ impl Scheduler {
             note: step_data.note,
             velocity: step_data.velocity,
             render_mode: step_data.render_mode,
+            track_level: step_data.track_level,
+            master_level: step_data.master_level,
+            send_mfx: step_data.send_mfx,
+            send_delay: step_data.send_delay,
+            send_reverb: step_data.send_reverb,
             instrument_id: step_data.instrument_id,
             waveform: step_data.synth_params.waveform,
             attack_ms: step_data.synth_params.attack_ms,
@@ -229,6 +239,9 @@ impl Scheduler {
         let profile = self.resolve_instrument_profile(project, step.instrument_id);
         let render_mode = profile.render_mode;
         let sampler_render = profile.sampler_render;
+        let (send_mfx, send_delay, send_reverb) = self.resolve_effective_send_levels(project, step.instrument_id);
+        let track_level = project.mixer.track_levels[track_index];
+        let master_level = project.mixer.master_level;
         let mut note_length_steps = profile.note_length_steps;
         let synth_params = profile.synth_params;
 
@@ -265,6 +278,11 @@ impl Scheduler {
             note,
             velocity,
             render_mode,
+            track_level,
+            master_level,
+            send_mfx,
+            send_delay,
+            send_reverb,
             sampler_render,
             instrument_id: step.instrument_id,
             note_length_steps,
@@ -339,6 +357,29 @@ impl Scheduler {
         }
         let index = phrase_step % table.rows.len();
         table.rows.get(index)
+    }
+
+    fn resolve_effective_send_levels(
+        &self,
+        project: &ProjectData,
+        instrument_id: Option<InstrumentId>,
+    ) -> (u8, u8, u8) {
+        let global = project.mixer.send_levels.clone();
+        let instrument = instrument_id.and_then(|id| project.instruments.get(&id));
+
+        let instrument_mfx = instrument.map(|inst| inst.send_levels.mfx).unwrap_or_default();
+        let instrument_delay = instrument
+            .map(|inst| inst.send_levels.delay)
+            .unwrap_or_default();
+        let instrument_reverb = instrument
+            .map(|inst| inst.send_levels.reverb)
+            .unwrap_or_default();
+
+        (
+            scale_send(instrument_mfx, global.mfx),
+            scale_send(instrument_delay, global.delay),
+            scale_send(instrument_reverb, global.reverb),
+        )
     }
 
     fn apply_fx_commands(
@@ -554,6 +595,10 @@ impl Scheduler {
 
         0
     }
+}
+
+fn scale_send(instrument_send: u8, global_send: u8) -> u8 {
+    ((instrument_send as u16 * global_send as u16) / 127) as u8
 }
 
 #[cfg(test)]
@@ -1149,6 +1194,72 @@ mod tests {
         assert_eq!(note_on.1, SamplerRenderVariant::Air);
         assert_eq!(note_on.2, 99);
         assert_eq!(note_on.3, 31);
+    }
+
+    #[test]
+    fn mixer_routing_levels_are_forwarded_to_render_event() {
+        let mut engine = setup_engine();
+        let mut instrument = Instrument::new(0, InstrumentType::Synth, "Mix");
+        instrument.send_levels.mfx = 100;
+        instrument.send_levels.delay = 80;
+        instrument.send_levels.reverb = 60;
+        engine
+            .apply_command(EngineCommand::UpsertInstrument { instrument })
+            .unwrap();
+        engine
+            .apply_command(EngineCommand::SetTrackLevel {
+                track_index: 0,
+                level: 101,
+            })
+            .unwrap();
+        engine
+            .apply_command(EngineCommand::SetMasterLevel { level: 109 })
+            .unwrap();
+        engine
+            .apply_command(EngineCommand::SetMixerSends {
+                mfx: 64,
+                delay: 32,
+                reverb: 96,
+            })
+            .unwrap();
+        engine
+            .apply_command(EngineCommand::SetPhraseStep {
+                phrase_id: 0,
+                step_index: 0,
+                note: Some(60),
+                velocity: 100,
+                instrument_id: Some(0),
+            })
+            .unwrap();
+
+        let mut scheduler = Scheduler::new(4);
+        let events = scheduler.tick(&engine);
+        let routed = events
+            .iter()
+            .find_map(|event| match event {
+                RenderEvent::NoteOn {
+                    track_level,
+                    master_level,
+                    send_mfx,
+                    send_delay,
+                    send_reverb,
+                    ..
+                } => Some((
+                    *track_level,
+                    *master_level,
+                    *send_mfx,
+                    *send_delay,
+                    *send_reverb,
+                )),
+                _ => None,
+            })
+            .expect("expected note on");
+
+        assert_eq!(routed.0, 101);
+        assert_eq!(routed.1, 109);
+        assert_eq!(routed.2, 50);
+        assert_eq!(routed.3, 20);
+        assert_eq!(routed.4, 45);
     }
 
     fn count_note_on(events: &[RenderEvent]) -> usize {
