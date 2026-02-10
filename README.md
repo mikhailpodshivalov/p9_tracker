@@ -2,7 +2,7 @@
 
 ## Status
 
-- Current stage: `Phase 19.3a FX routing contracts completed`
+- Current stage: `Phase 19.3b export routing parity completed`
 - Main implementation stack: `Rust`
 
 ## Phase 1 Artifacts
@@ -153,6 +153,10 @@
 ## Phase 19.3a Artifacts
 
 - `docs/phase19_3a_fx_routing_contracts.md`
+
+## Phase 19.3b Artifacts
+
+- `docs/phase19_3b_export_routing_parity.md`
 
 ## Forward Plan
 

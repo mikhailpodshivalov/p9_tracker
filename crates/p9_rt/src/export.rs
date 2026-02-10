@@ -55,6 +55,9 @@ struct ActiveVoice {
     note: u8,
     waveform: SynthWaveform,
     mode: VoiceRenderMode,
+    send_mfx: f32,
+    send_delay: f32,
+    send_reverb: f32,
     sampler_variant: SamplerRenderVariant,
     sampler_transient_level: f32,
     sampler_body_level: f32,
@@ -72,6 +75,39 @@ struct ActiveVoice {
 enum VoiceRenderMode {
     Standard,
     SamplerV1,
+}
+
+#[derive(Clone, Debug)]
+struct RenderFxState {
+    delay_line: Vec<f32>,
+    delay_index: usize,
+    reverb_lp: f32,
+}
+
+impl RenderFxState {
+    fn new(sample_rate_hz: u32) -> Self {
+        let delay_samples = (sample_rate_hz / 8).max(1) as usize;
+        Self {
+            delay_line: vec![0.0; delay_samples],
+            delay_index: 0,
+            reverb_lp: 0.0,
+        }
+    }
+
+    fn process_returns(&mut self, send_mfx: f32, send_delay: f32, send_reverb: f32) -> f32 {
+        let mfx = soft_clip(send_mfx * 1.8) * 0.42;
+
+        let delayed = self.delay_line[self.delay_index];
+        let delay_input = send_delay + delayed * 0.45;
+        self.delay_line[self.delay_index] = delay_input;
+        self.delay_index = (self.delay_index + 1) % self.delay_line.len();
+        let delay_out = delayed * 0.34;
+
+        self.reverb_lp = self.reverb_lp * 0.82 + send_reverb * 0.18;
+        let reverb_out = self.reverb_lp * 0.28;
+
+        (mfx + delay_out + reverb_out).clamp(-1.0, 1.0)
+    }
 }
 
 pub fn render_project_to_wav(
@@ -94,6 +130,7 @@ pub fn render_project_to_wav(
     let samples_per_tick = samples_per_tick(config.sample_rate_hz, tempo, config.ppq);
     let mut scheduler = Scheduler::new(config.ppq);
     let mut voices: Vec<ActiveVoice> = Vec::new();
+    let mut fx_state = RenderFxState::new(config.sample_rate_hz);
     let mut samples = Vec::<i16>::with_capacity(
         samples_per_tick
             .saturating_mul(config.ticks as usize)
@@ -111,7 +148,7 @@ pub fn render_project_to_wav(
         }
 
         for _ in 0..samples_per_tick {
-            let sample = synthesize_sample(&mut voices);
+            let sample = synthesize_sample_routed(&mut voices, &mut fx_state);
             let sample_i16 = (sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
             peak_abs_sample = peak_abs_sample.max(sample_i16.saturating_abs());
             samples.push(sample_i16);
@@ -145,6 +182,11 @@ fn apply_event(voices: &mut Vec<ActiveVoice>, event: &RenderEvent, sample_rate_h
             note,
             velocity,
             render_mode,
+            track_level,
+            master_level,
+            send_mfx,
+            send_delay,
+            send_reverb,
             sampler_variant,
             sampler_transient_level,
             sampler_body_level,
@@ -164,6 +206,8 @@ fn apply_event(voices: &mut Vec<ActiveVoice>, event: &RenderEvent, sample_rate_h
             let phase_inc = TAU * (freq_hz / sample_rate_hz.max(1.0));
             let velocity_gain = *velocity as f32 / 127.0;
             let instrument_gain = *gain as f32 / 127.0;
+            let track_gain = (*track_level as f32 / 127.0).clamp(0.0, 1.0);
+            let master_gain = (*master_level as f32 / 127.0).clamp(0.0, 1.0);
             let mode = match render_mode {
                 RenderMode::SamplerV1 => VoiceRenderMode::SamplerV1,
                 RenderMode::Synth | RenderMode::ExternalMuted => VoiceRenderMode::Standard,
@@ -178,12 +222,16 @@ fn apply_event(voices: &mut Vec<ActiveVoice>, event: &RenderEvent, sample_rate_h
                 note: *note,
                 waveform: *waveform,
                 mode,
+                send_mfx: (*send_mfx as f32 / 127.0).clamp(0.0, 1.0),
+                send_delay: (*send_delay as f32 / 127.0).clamp(0.0, 1.0),
+                send_reverb: (*send_reverb as f32 / 127.0).clamp(0.0, 1.0),
                 sampler_variant: *sampler_variant,
                 sampler_transient_level: *sampler_transient_level as f32 / 127.0,
                 sampler_body_level: *sampler_body_level as f32 / 127.0,
                 phase: 0.0,
                 phase_inc,
-                amplitude: (velocity_gain * instrument_gain * mode_gain).clamp(0.0, 1.0),
+                amplitude: (velocity_gain * instrument_gain * track_gain * master_gain * mode_gain)
+                    .clamp(0.0, 1.0),
                 elapsed_samples: 0,
                 attack_samples: ms_to_samples(*attack_ms, sample_rate_hz),
                 release_samples: ms_to_samples(*release_ms, sample_rate_hz),
@@ -202,6 +250,7 @@ fn apply_event(voices: &mut Vec<ActiveVoice>, event: &RenderEvent, sample_rate_h
     }
 }
 
+#[cfg(test)]
 fn synthesize_sample(voices: &mut Vec<ActiveVoice>) -> f32 {
     if voices.is_empty() {
         return 0.0;
@@ -236,6 +285,54 @@ fn synthesize_sample(voices: &mut Vec<ActiveVoice>) -> f32 {
     });
 
     mixed
+}
+
+fn synthesize_sample_routed(voices: &mut Vec<ActiveVoice>, fx_state: &mut RenderFxState) -> f32 {
+    if voices.is_empty() {
+        return fx_state.process_returns(0.0, 0.0, 0.0);
+    }
+
+    let mut dry_mixed = 0.0f32;
+    let mut send_mfx = 0.0f32;
+    let mut send_delay = 0.0f32;
+    let mut send_reverb = 0.0f32;
+
+    for voice in voices.iter_mut() {
+        let osc = oscillator_sample(voice);
+        let env = envelope_sample(voice);
+        let sample = osc * voice.amplitude * env;
+
+        let total_send = (voice.send_mfx + voice.send_delay + voice.send_reverb).clamp(0.0, 1.0);
+        let dry_scale = (1.0 - total_send * 0.6).clamp(0.4, 1.0);
+        dry_mixed += sample * dry_scale;
+        send_mfx += sample * voice.send_mfx;
+        send_delay += sample * voice.send_delay;
+        send_reverb += sample * voice.send_reverb;
+
+        voice.phase += voice.phase_inc;
+        if voice.phase >= TAU {
+            voice.phase -= TAU;
+        }
+        voice.elapsed_samples = voice.elapsed_samples.saturating_add(1);
+        if voice.releasing && voice.release_samples > 0 {
+            voice.release_progress_samples = voice.release_progress_samples.saturating_add(1);
+        }
+    }
+
+    voices.retain(|voice| {
+        if !voice.releasing {
+            return true;
+        }
+
+        if voice.release_samples == 0 {
+            return false;
+        }
+
+        voice.release_progress_samples < voice.release_samples
+    });
+
+    let returns = fx_state.process_returns(send_mfx, send_delay, send_reverb);
+    (dry_mixed + returns).clamp(-1.0, 1.0)
 }
 
 fn oscillator_sample(voice: &ActiveVoice) -> f32 {
@@ -313,6 +410,10 @@ fn ms_to_samples(ms: u16, sample_rate_hz: f32) -> u32 {
     samples.max(1.0) as u32
 }
 
+fn soft_clip(value: f32) -> f32 {
+    value / (1.0 + value.abs())
+}
+
 fn write_wav_mono_i16(path: &Path, sample_rate_hz: u32, samples: &[i16]) -> Result<(), ExportError> {
     let data_len = samples
         .len()
@@ -349,7 +450,10 @@ fn write_wav_mono_i16(path: &Path, sample_rate_hz: u32, samples: &[i16]) -> Resu
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_event, render_project_to_wav, synthesize_sample, OfflineRenderConfig};
+    use super::{
+        apply_event, render_project_to_wav, synthesize_sample, synthesize_sample_routed,
+        OfflineRenderConfig, RenderFxState,
+    };
     use p9_core::engine::{Engine, EngineCommand};
     use p9_core::events::{RenderEvent, RenderMode};
     use p9_core::model::{Chain, Instrument, InstrumentType, Phrase};
@@ -638,6 +742,115 @@ mod tests {
         assert!(!synth_voices.is_empty());
         assert!(!sampler_voices.is_empty());
         assert_ne!(synth_energy, sampler_energy);
+    }
+
+    #[test]
+    fn mixer_levels_scale_export_energy() {
+        let mut full_mix_voices = Vec::new();
+        let mut muted_mix_voices = Vec::new();
+        let mut full_fx = RenderFxState::new(48_000);
+        let mut muted_fx = RenderFxState::new(48_000);
+
+        apply_event(
+            &mut full_mix_voices,
+            &RenderEvent::NoteOn {
+                track_id: 0,
+                note: 60,
+                velocity: 110,
+                render_mode: RenderMode::Synth,
+                track_level: 127,
+                master_level: 127,
+                send_mfx: 0,
+                send_delay: 0,
+                send_reverb: 0,
+                instrument_id: Some(0),
+                waveform: p9_core::model::SynthWaveform::Saw,
+                attack_ms: 1,
+                release_ms: 48,
+                gain: 100,
+                sampler_variant: p9_core::model::SamplerRenderVariant::Classic,
+                sampler_transient_level: 64,
+                sampler_body_level: 96,
+            },
+            48_000.0,
+        );
+
+        apply_event(
+            &mut muted_mix_voices,
+            &RenderEvent::NoteOn {
+                track_id: 0,
+                note: 60,
+                velocity: 110,
+                render_mode: RenderMode::Synth,
+                track_level: 0,
+                master_level: 127,
+                send_mfx: 0,
+                send_delay: 0,
+                send_reverb: 0,
+                instrument_id: Some(0),
+                waveform: p9_core::model::SynthWaveform::Saw,
+                attack_ms: 1,
+                release_ms: 48,
+                gain: 100,
+                sampler_variant: p9_core::model::SamplerRenderVariant::Classic,
+                sampler_transient_level: 64,
+                sampler_body_level: 96,
+            },
+            48_000.0,
+        );
+
+        let mut full_energy = 0.0f32;
+        let mut muted_energy = 0.0f32;
+        for _ in 0..64 {
+            full_energy += synthesize_sample_routed(&mut full_mix_voices, &mut full_fx).abs();
+            muted_energy += synthesize_sample_routed(&mut muted_mix_voices, &mut muted_fx).abs();
+        }
+
+        assert!(full_energy > 0.1);
+        assert!(muted_energy < full_energy * 0.05);
+    }
+
+    #[test]
+    fn send_routing_changes_export_signature() {
+        fn render_signature(send_mfx: u8, send_delay: u8, send_reverb: u8) -> i64 {
+            let mut voices = Vec::new();
+            let mut fx = RenderFxState::new(48_000);
+            apply_event(
+                &mut voices,
+                &RenderEvent::NoteOn {
+                    track_id: 0,
+                    note: 60,
+                    velocity: 112,
+                    render_mode: RenderMode::Synth,
+                    track_level: 127,
+                    master_level: 127,
+                    send_mfx,
+                    send_delay,
+                    send_reverb,
+                    instrument_id: Some(0),
+                    waveform: p9_core::model::SynthWaveform::Saw,
+                    attack_ms: 1,
+                    release_ms: 56,
+                    gain: 100,
+                    sampler_variant: p9_core::model::SamplerRenderVariant::Classic,
+                    sampler_transient_level: 64,
+                    sampler_body_level: 96,
+                },
+                48_000.0,
+            );
+
+            let mut signature = 0.0f64;
+            for frame in 0u32..192 {
+                let sample = synthesize_sample_routed(&mut voices, &mut fx);
+                signature += sample as f64 * (frame + 1) as f64;
+            }
+
+            (signature * 1_000_000.0).round() as i64
+        }
+
+        let dry = render_signature(0, 0, 0);
+        let routed = render_signature(96, 64, 48);
+        assert_ne!(dry, routed);
     }
 
     #[test]
