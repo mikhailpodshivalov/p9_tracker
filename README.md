@@ -2,7 +2,7 @@
 
 ## Status
 
-- Current stage: `Phase 16.3 dirty state and recovery entry completed`
+- Current stage: `Phase 16.4 workflow hardening and regression pack completed`
 - Main implementation stack: `Rust`
 
 ## Phase 1 Artifacts
@@ -88,6 +88,7 @@
 - `docs/phase16_1_undo_redo_foundation.md`
 - `docs/phase16_2_selection_block_ops.md`
 - `docs/phase16_3_dirty_recovery_entry.md`
+- `docs/phase16_4_workflow_hardening_regression.md`
 
 ## Forward Plan
 

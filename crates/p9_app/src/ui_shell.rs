@@ -104,10 +104,28 @@ pub struct StepClipboard {
     steps: Vec<Step>,
 }
 
+#[derive(Clone, Debug)]
+pub struct PasteOverwriteGuard {
+    track_index: usize,
+    phrase_id: u8,
+    start_step: usize,
+    len: usize,
+}
+
+impl PasteOverwriteGuard {
+    fn matches(&self, track_index: usize, phrase_id: u8, start_step: usize, len: usize) -> bool {
+        self.track_index == track_index
+            && self.phrase_id == phrase_id
+            && self.start_step == start_step
+            && self.len == len
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct ShellEditState {
     selection: Option<StepSelection>,
     clipboard: Option<StepClipboard>,
+    paste_overwrite_guard: Option<PasteOverwriteGuard>,
 }
 
 pub fn run_interactive_shell(
@@ -124,7 +142,7 @@ pub fn run_interactive_shell(
     });
 
     let mut status = format!(
-        "Shell ready. Commands: n/p/h/l/j/k/t/r/c/f/i/e/a/z/w/v/x/+/-/u/y/?/q | recovery={}",
+        "Shell ready. Commands: n/p/h/l/j/k/t/r/c/f/i/e/a/z/w/v/V/x/+/-/u/y/?/q | recovery={}",
         recovery_status.label()
     );
     let mut audio = NoopAudioBackend::default();
@@ -155,6 +173,7 @@ pub fn run_interactive_shell(
             &mut edit_state,
         ) {
             Ok(ShellCommandResult::Continue(next_status)) => {
+                let (status_level, status_body) = classify_status_message(&next_status);
                 let tick_status = match runtime.run_tick_safe(engine, &mut audio, &mut midi_output) {
                     Ok(report) => {
                         format!(
@@ -174,8 +193,9 @@ pub fn run_interactive_shell(
                     &dirty_flag_path,
                 );
                 status = format!(
-                    "{} | {} | recovery={} | {}",
-                    next_status,
+                    "{}: {} | {} | recovery={} | {}",
+                    status_level,
+                    status_body,
                     tick_status,
                     recovery_status.label(),
                     hardening_status
@@ -185,7 +205,7 @@ pub fn run_interactive_shell(
                 break;
             }
             Err(err) => {
-                status = format!("command error: {err:?}");
+                status = format!("error: command execution failed: {err:?}");
             }
         }
     }
@@ -302,6 +322,12 @@ pub fn apply_shell_command_with_state(
             Ok(ShellCommandResult::Continue(String::from("transport -> toggle")))
         }
         "r" => {
+            let transport = runtime.snapshot();
+            if transport.tick == 0 && !transport.is_playing {
+                return Ok(ShellCommandResult::Continue(String::from(
+                    "warn: transport already stopped at start",
+                )));
+            }
             ui.handle_action(UiAction::RewindTransport, engine, runtime)?;
             Ok(ShellCommandResult::Continue(String::from(
                 "transport -> stop+rewind",
@@ -487,67 +513,18 @@ pub fn apply_shell_command_with_state(
             )))
         }
         "v" => {
-            let snapshot = ui.snapshot(engine, runtime);
-            let target_phrase_id = match resolve_bound_phrase_id(engine.snapshot(), snapshot) {
-                Ok(phrase_id) => phrase_id,
-                Err(message) => return Ok(ShellCommandResult::Continue(String::from(message))),
-            };
-
-            let Some(clipboard) = edit_state.clipboard.as_ref() else {
-                return Ok(ShellCommandResult::Continue(String::from(
-                    "warn: clipboard empty; run w first",
-                )));
-            };
-            if clipboard.source_track != snapshot.focused_track {
-                return Ok(ShellCommandResult::Continue(String::from(
-                    "warn: clipboard track mismatch; focus source track or recopy",
-                )));
-            }
-            if !engine.snapshot().phrases.contains_key(&target_phrase_id) {
-                return Ok(ShellCommandResult::Continue(String::from(
-                    "warn: selected phrase missing; run f first",
-                )));
-            }
-
-            let available = PHRASE_STEP_COUNT.saturating_sub(snapshot.selected_step);
-            let paste_len = clipboard.steps.len().min(available);
-            if paste_len == 0 {
-                return Ok(ShellCommandResult::Continue(String::from(
-                    "warn: paste target out of range",
-                )));
-            }
-
-            ui.handle_action(UiAction::SelectPhrase(target_phrase_id), engine, runtime)?;
-            for (offset, step) in clipboard.steps.iter().take(paste_len).enumerate() {
-                apply_step(engine, target_phrase_id, snapshot.selected_step + offset, step)?;
-            }
-
-            let end_step = snapshot.selected_step + paste_len - 1;
-            edit_state.selection = Some(StepSelection {
-                track_index: snapshot.focused_track,
-                phrase_id: target_phrase_id,
-                start_step: snapshot.selected_step,
-                end_step,
-            });
-
-            let clipped = clipboard.steps.len() - paste_len;
-            if clipped > 0 {
-                Ok(ShellCommandResult::Continue(format!(
-                    "paste -> phrase {} steps {:02}-{:02} len {} (clipped {})",
-                    target_phrase_id, snapshot.selected_step, end_step, paste_len, clipped
-                )))
-            } else {
-                Ok(ShellCommandResult::Continue(format!(
-                    "paste -> phrase {} steps {:02}-{:02} len {}",
-                    target_phrase_id, snapshot.selected_step, end_step, paste_len
-                )))
-            }
+            apply_paste_from_clipboard(ui, engine, runtime, edit_state, false)
+        }
+        "V" => {
+            apply_paste_from_clipboard(ui, engine, runtime, edit_state, true)
         }
         "x" => {
             if edit_state.selection.take().is_some() {
                 Ok(ShellCommandResult::Continue(String::from("select -> cleared")))
             } else {
-                Ok(ShellCommandResult::Continue(String::from("select -> empty")))
+                Ok(ShellCommandResult::Continue(String::from(
+                    "warn: selection already empty",
+                )))
             }
         }
         "+" => {
@@ -582,7 +559,7 @@ pub fn apply_shell_command_with_state(
         "q" => Ok(ShellCommandResult::Exit),
         "" => Ok(ShellCommandResult::Continue(String::from("idle"))),
         _ => Ok(ShellCommandResult::Continue(String::from(
-            "unknown command; use n/p/h/l/j/k/t/r/c/f/i/e/a/z/w/v/x/+/-/u/y/?/q",
+            "warn: unknown command; use n/p/h/l/j/k/t/r/c/f/i/e/a/z/w/v/V/x/+/-/u/y/?/q",
         ))),
     }
 }
@@ -590,7 +567,7 @@ pub fn apply_shell_command_with_state(
 pub fn render_frame(project: &ProjectData, snapshot: UiSnapshot, status: &str) -> String {
     let mut out = String::new();
 
-    out.push_str("P9 Tracker UI Shell (Phase 16.3)\n");
+    out.push_str("P9 Tracker UI Shell (Phase 16.4)\n");
     out.push_str("Screen Tabs: ");
     out.push_str(&tab(UiScreen::Song, snapshot.screen));
     out.push(' ');
@@ -628,7 +605,7 @@ pub fn render_frame(project: &ProjectData, snapshot: UiSnapshot, status: &str) -
     out.push_str("----------------------------------------------------------------\n");
     out.push_str(&format!("Status: {status}\n"));
     out.push_str(
-        "Commands: n/p screen, h/l track, j/k cursor, t play, r rewind, c/f/i/e edit, a/z/w/v/x block, +/- level, u/y undo-redo, ? help, q quit\n",
+        "Commands: n/p screen, h/l track, j/k cursor, t play, r rewind, c/f/i/e edit, a/z/w/v/V/x block, +/- level, u/y undo-redo, ? help, q quit\n",
     );
 
     out
@@ -713,16 +690,142 @@ fn apply_step(
     Ok(())
 }
 
+fn apply_paste_from_clipboard(
+    ui: &mut UiController,
+    engine: &mut Engine,
+    runtime: &mut RuntimeCoordinator,
+    edit_state: &mut ShellEditState,
+    force_overwrite: bool,
+) -> Result<ShellCommandResult, UiError> {
+    let snapshot = ui.snapshot(engine, runtime);
+    let target_phrase_id = match resolve_bound_phrase_id(engine.snapshot(), snapshot) {
+        Ok(phrase_id) => phrase_id,
+        Err(message) => return Ok(ShellCommandResult::Continue(String::from(message))),
+    };
+
+    let Some(clipboard) = edit_state.clipboard.as_ref() else {
+        return Ok(ShellCommandResult::Continue(String::from(
+            "warn: clipboard empty; run w first",
+        )));
+    };
+    let clipboard_source_track = clipboard.source_track;
+    let clipboard_steps = clipboard.steps.clone();
+
+    if clipboard_source_track != snapshot.focused_track {
+        return Ok(ShellCommandResult::Continue(String::from(
+            "warn: clipboard track mismatch; focus source track or recopy",
+        )));
+    }
+    if !engine.snapshot().phrases.contains_key(&target_phrase_id) {
+        return Ok(ShellCommandResult::Continue(String::from(
+            "warn: selected phrase missing; run f first",
+        )));
+    }
+
+    let available = PHRASE_STEP_COUNT.saturating_sub(snapshot.selected_step);
+    let paste_len = clipboard_steps.len().min(available);
+    if paste_len == 0 {
+        return Ok(ShellCommandResult::Continue(String::from(
+            "warn: paste target out of range",
+        )));
+    }
+
+    let end_step = snapshot.selected_step + paste_len - 1;
+    let target_has_data = engine
+        .snapshot()
+        .phrases
+        .get(&target_phrase_id)
+        .map(|phrase| {
+            phrase.steps[snapshot.selected_step..=end_step]
+                .iter()
+                .any(step_has_payload)
+        })
+        .unwrap_or(false);
+
+    if target_has_data && !force_overwrite {
+        edit_state.paste_overwrite_guard = Some(PasteOverwriteGuard {
+            track_index: snapshot.focused_track,
+            phrase_id: target_phrase_id,
+            start_step: snapshot.selected_step,
+            len: paste_len,
+        });
+        return Ok(ShellCommandResult::Continue(String::from(
+            "warn: paste target has data; run V to confirm overwrite",
+        )));
+    }
+
+    if force_overwrite {
+        let Some(guard) = edit_state.paste_overwrite_guard.as_ref() else {
+            return Ok(ShellCommandResult::Continue(String::from(
+                "warn: overwrite confirmation missing; run v first",
+            )));
+        };
+        if !guard.matches(
+            snapshot.focused_track,
+            target_phrase_id,
+            snapshot.selected_step,
+            paste_len,
+        ) {
+            return Ok(ShellCommandResult::Continue(String::from(
+                "warn: overwrite context changed; run v again",
+            )));
+        }
+    }
+
+    edit_state.paste_overwrite_guard = None;
+    ui.handle_action(UiAction::SelectPhrase(target_phrase_id), engine, runtime)?;
+    for (offset, step) in clipboard_steps.iter().take(paste_len).enumerate() {
+        apply_step(engine, target_phrase_id, snapshot.selected_step + offset, step)?;
+    }
+
+    edit_state.selection = Some(StepSelection {
+        track_index: snapshot.focused_track,
+        phrase_id: target_phrase_id,
+        start_step: snapshot.selected_step,
+        end_step,
+    });
+
+    let clipped = clipboard_steps.len() - paste_len;
+    if clipped > 0 {
+        Ok(ShellCommandResult::Continue(format!(
+            "paste -> phrase {} steps {:02}-{:02} len {} (clipped {})",
+            target_phrase_id, snapshot.selected_step, end_step, paste_len, clipped
+        )))
+    } else {
+        Ok(ShellCommandResult::Continue(format!(
+            "paste -> phrase {} steps {:02}-{:02} len {}",
+            target_phrase_id, snapshot.selected_step, end_step, paste_len
+        )))
+    }
+}
+
+fn step_has_payload(step: &Step) -> bool {
+    step.note.is_some()
+        || step.instrument_id.is_some()
+        || step.velocity != 0x40
+        || step.fx.iter().any(|slot| slot.is_some())
+}
+
 fn command_help() -> &'static str {
-    "help: n/p screen, h/l track, j/k cursor, t play/stop, r stop+rewind, c bind chain, f bind phrase, i ensure instrument, e edit step, a/z selection start/end, w copy, v paste, x clear selection, +/- level, u undo, y redo"
+    "help: n/p screen, h/l track, j/k cursor, t play/stop, r stop+rewind, c bind chain, f bind phrase, i ensure instrument, e edit step, a/z selection start/end, w copy, v safe-paste, V force-paste, x clear selection, +/- level, u undo, y redo | status tags: info/warn/error"
 }
 
 fn is_mutating_command(command: &str) -> bool {
-    matches!(command, "c" | "f" | "i" | "e" | "v" | "+" | "-")
+    matches!(command, "c" | "f" | "i" | "e" | "v" | "V" | "+" | "-")
 }
 
 fn command_did_mutate(result: &ShellCommandResult) -> bool {
     matches!(result, ShellCommandResult::Continue(msg) if !msg.starts_with("warn:"))
+}
+
+fn classify_status_message(message: &str) -> (&'static str, &str) {
+    if let Some(stripped) = message.strip_prefix("warn: ") {
+        ("warn", stripped)
+    } else if let Some(stripped) = message.strip_prefix("error: ") {
+        ("error", stripped)
+    } else {
+        ("info", message)
+    }
 }
 
 fn update_session_hardening(
@@ -939,12 +1042,64 @@ mod tests {
         apply_shell_command, apply_shell_command_with_history, apply_shell_command_with_history_state,
         render_frame, ProjectHistory, ShellCommandResult, ShellEditState,
     };
+    use crate::hardening::{
+        mark_dirty_session_flag, recover_from_dirty_session, AutosaveManager, AutosavePolicy,
+        DirtyStateTracker, RecoveryStatus,
+    };
     use crate::runtime::RuntimeCoordinator;
     use crate::ui::{UiAction, UiController, UiScreen};
     use p9_core::engine::{Engine, EngineCommand};
     use p9_core::model::FxCommand;
     use p9_rt::audio::{AudioBackend, NoopAudioBackend};
     use p9_rt::midi::NoopMidiOutput;
+    use p9_storage::project::ProjectEnvelope;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_file(prefix: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        let mut path = std::env::temp_dir();
+        path.push(format!("{}_{}_{}.p9", prefix, std::process::id(), nanos));
+        path
+    }
+
+    fn run_shell_script(commands: &[&str]) -> (String, crate::runtime::TransportSnapshot, Vec<String>) {
+        let mut ui = UiController::default();
+        let mut engine = Engine::new("script");
+        let mut runtime = RuntimeCoordinator::new(24);
+        let mut history = ProjectHistory::with_limit(64);
+        let mut edit_state = ShellEditState::default();
+        let mut statuses = Vec::new();
+        let mut audio = NoopAudioBackend::default();
+        audio.start();
+        let mut midi = NoopMidiOutput::default();
+
+        for command in commands {
+            let result = apply_shell_command_with_history_state(
+                command,
+                &mut ui,
+                &mut engine,
+                &mut runtime,
+                &mut history,
+                &mut edit_state,
+            )
+            .unwrap();
+            match result {
+                ShellCommandResult::Continue(status) => {
+                    statuses.push(status);
+                    let _ = runtime.run_tick(&engine, &mut audio, &mut midi);
+                }
+                ShellCommandResult::Exit => break,
+            }
+        }
+
+        let project_text = ProjectEnvelope::new(engine.snapshot().clone()).to_text();
+        (project_text, runtime.snapshot(), statuses)
+    }
 
     #[test]
     fn render_frame_contains_shell_layout_sections() {
@@ -955,7 +1110,7 @@ mod tests {
         let snapshot = ui.snapshot(&engine, &runtime);
         let frame = render_frame(engine.snapshot(), snapshot, "ok");
 
-        assert!(frame.contains("P9 Tracker UI Shell (Phase 16.3)"));
+        assert!(frame.contains("P9 Tracker UI Shell (Phase 16.4)"));
         assert!(frame.contains("Screen Tabs:"));
         assert!(frame.contains("Song Panel"));
         assert!(frame.contains("Commands: n/p screen"));
@@ -1015,6 +1170,28 @@ mod tests {
 
         let _ = apply_shell_command("r", &mut ui, &mut engine, &mut runtime).unwrap();
         assert_eq!(runtime.snapshot().queued_commands, 3);
+    }
+
+    #[test]
+    fn shell_rewind_warns_when_transport_already_at_start() {
+        let mut ui = UiController::default();
+        let mut engine = Engine::new("shell");
+        let mut runtime = RuntimeCoordinator::new(24);
+        let mut audio = NoopAudioBackend::default();
+        audio.start();
+        let mut midi = NoopMidiOutput::default();
+
+        let _ = apply_shell_command("t", &mut ui, &mut engine, &mut runtime).unwrap();
+        let _ = runtime.run_tick(&engine, &mut audio, &mut midi);
+
+        let result = apply_shell_command("r", &mut ui, &mut engine, &mut runtime).unwrap();
+        assert_eq!(
+            result,
+            ShellCommandResult::Continue(String::from(
+                "warn: transport already stopped at start"
+            ))
+        );
+        assert_eq!(runtime.snapshot().queued_commands, 0);
     }
 
     #[test]
@@ -1449,6 +1626,262 @@ mod tests {
                 "warn: clipboard track mismatch; focus source track or recopy"
             ))
         );
+    }
+
+    #[test]
+    fn shell_safe_paste_requires_overwrite_confirmation() {
+        let mut ui = UiController::default();
+        let mut engine = Engine::new("shell");
+        let mut runtime = RuntimeCoordinator::new(24);
+        let mut history = ProjectHistory::with_limit(32);
+        let mut edit_state = ShellEditState::default();
+
+        for command in ["c", "f", "i"] {
+            let _ = apply_shell_command_with_history_state(
+                command,
+                &mut ui,
+                &mut engine,
+                &mut runtime,
+                &mut history,
+                &mut edit_state,
+            )
+            .unwrap();
+        }
+
+        let _ = apply_shell_command_with_history_state(
+            "n",
+            &mut ui,
+            &mut engine,
+            &mut runtime,
+            &mut history,
+            &mut edit_state,
+        )
+        .unwrap();
+        let _ = apply_shell_command_with_history_state(
+            "n",
+            &mut ui,
+            &mut engine,
+            &mut runtime,
+            &mut history,
+            &mut edit_state,
+        )
+        .unwrap();
+
+        let _ = apply_shell_command_with_history_state(
+            "e",
+            &mut ui,
+            &mut engine,
+            &mut runtime,
+            &mut history,
+            &mut edit_state,
+        )
+        .unwrap();
+        let _ = apply_shell_command_with_history_state(
+            "a",
+            &mut ui,
+            &mut engine,
+            &mut runtime,
+            &mut history,
+            &mut edit_state,
+        )
+        .unwrap();
+        let _ = apply_shell_command_with_history_state(
+            "w",
+            &mut ui,
+            &mut engine,
+            &mut runtime,
+            &mut history,
+            &mut edit_state,
+        )
+        .unwrap();
+
+        let warn = apply_shell_command_with_history_state(
+            "v",
+            &mut ui,
+            &mut engine,
+            &mut runtime,
+            &mut history,
+            &mut edit_state,
+        )
+        .unwrap();
+        assert_eq!(
+            warn,
+            ShellCommandResult::Continue(String::from(
+                "warn: paste target has data; run V to confirm overwrite"
+            ))
+        );
+
+        let confirm = apply_shell_command_with_history_state(
+            "V",
+            &mut ui,
+            &mut engine,
+            &mut runtime,
+            &mut history,
+            &mut edit_state,
+        )
+        .unwrap();
+        assert_eq!(
+            confirm,
+            ShellCommandResult::Continue(String::from(
+                "paste -> phrase 0 steps 00-00 len 1"
+            ))
+        );
+    }
+
+    #[test]
+    fn shell_force_paste_requires_armed_guard() {
+        let mut ui = UiController::default();
+        let mut engine = Engine::new("shell");
+        let mut runtime = RuntimeCoordinator::new(24);
+        let mut history = ProjectHistory::with_limit(32);
+        let mut edit_state = ShellEditState::default();
+
+        for command in ["c", "f", "i"] {
+            let _ = apply_shell_command_with_history_state(
+                command,
+                &mut ui,
+                &mut engine,
+                &mut runtime,
+                &mut history,
+                &mut edit_state,
+            )
+            .unwrap();
+        }
+
+        let _ = apply_shell_command_with_history_state(
+            "n",
+            &mut ui,
+            &mut engine,
+            &mut runtime,
+            &mut history,
+            &mut edit_state,
+        )
+        .unwrap();
+        let _ = apply_shell_command_with_history_state(
+            "n",
+            &mut ui,
+            &mut engine,
+            &mut runtime,
+            &mut history,
+            &mut edit_state,
+        )
+        .unwrap();
+
+        let _ = apply_shell_command_with_history_state(
+            "a",
+            &mut ui,
+            &mut engine,
+            &mut runtime,
+            &mut history,
+            &mut edit_state,
+        )
+        .unwrap();
+        let _ = apply_shell_command_with_history_state(
+            "w",
+            &mut ui,
+            &mut engine,
+            &mut runtime,
+            &mut history,
+            &mut edit_state,
+        )
+        .unwrap();
+
+        let warn = apply_shell_command_with_history_state(
+            "V",
+            &mut ui,
+            &mut engine,
+            &mut runtime,
+            &mut history,
+            &mut edit_state,
+        )
+        .unwrap();
+        assert_eq!(
+            warn,
+            ShellCommandResult::Continue(String::from(
+                "warn: overwrite confirmation missing; run v first"
+            ))
+        );
+    }
+
+    #[test]
+    fn shell_long_command_sequence_is_deterministic() {
+        let commands = [
+            "r", "c", "f", "i", "n", "n", "e", "j", "e", "k", "a", "j", "z", "w", "v", "V", "bad",
+            "+", "-", "t", "r", "t", "u", "y", "x", "x", "?",
+        ];
+
+        let first = run_shell_script(&commands);
+        let second = run_shell_script(&commands);
+
+        assert_eq!(first.0, second.0);
+        assert_eq!(first.1, second.1);
+        assert_eq!(first.2, second.2);
+        assert!(first
+            .2
+            .iter()
+            .any(|status| status.contains("warn: paste target has data")));
+        assert!(first
+            .2
+            .iter()
+            .any(|status| status.contains("warn: unknown command")));
+    }
+
+    #[test]
+    fn shell_smoke_script_edit_play_save_recover() {
+        let autosave_path = temp_file("p9_phase16_4_smoke_autosave");
+        let dirty_flag_path = temp_file("p9_phase16_4_smoke_flag");
+
+        let mut ui = UiController::default();
+        let mut engine = Engine::new("smoke");
+        let mut runtime = RuntimeCoordinator::new(24);
+        let mut history = ProjectHistory::with_limit(64);
+        let mut edit_state = ShellEditState::default();
+        let mut dirty_tracker = DirtyStateTracker::from_engine(&engine);
+        let mut autosave = AutosaveManager::new(AutosavePolicy { interval_ticks: 1 });
+        let mut audio = NoopAudioBackend::default();
+        audio.start();
+        let mut midi = NoopMidiOutput::default();
+
+        let script = ["c", "f", "i", "n", "n", "e", "t"];
+        for command in script {
+            let result = apply_shell_command_with_history_state(
+                command,
+                &mut ui,
+                &mut engine,
+                &mut runtime,
+                &mut history,
+                &mut edit_state,
+            )
+            .unwrap();
+            assert!(matches!(result, ShellCommandResult::Continue(_)));
+            let _ = runtime.run_tick(&engine, &mut audio, &mut midi);
+        }
+
+        assert!(dirty_tracker.is_dirty(&engine));
+        mark_dirty_session_flag(&dirty_flag_path).unwrap();
+        let saved = autosave
+            .save_if_due(&engine, runtime.snapshot(), true, &autosave_path)
+            .unwrap();
+        assert!(saved);
+
+        let saved_text = ProjectEnvelope::new(engine.snapshot().clone()).to_text();
+        let mut recovered_engine = Engine::new("recovered");
+        let status = recover_from_dirty_session(
+            &mut recovered_engine,
+            &autosave_path,
+            &dirty_flag_path,
+        );
+        assert_eq!(status, RecoveryStatus::RecoveredFromAutosave);
+        assert_eq!(
+            ProjectEnvelope::new(recovered_engine.snapshot().clone()).to_text(),
+            saved_text
+        );
+
+        dirty_tracker.mark_saved(&engine);
+        assert!(!dirty_tracker.is_dirty(&engine));
+
+        let _ = fs::remove_file(&autosave_path);
+        let _ = fs::remove_file(&dirty_flag_path);
     }
 
     #[test]
