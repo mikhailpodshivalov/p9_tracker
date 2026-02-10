@@ -194,6 +194,9 @@ mod tests {
             attack_ms: 5,
             release_ms: 80,
             gain: 100,
+            sampler_variant: p9_core::model::SamplerRenderVariant::Classic,
+            sampler_transient_level: 64,
+            sampler_body_level: 96,
         }
     }
 

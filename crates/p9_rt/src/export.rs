@@ -5,7 +5,7 @@ use std::path::Path;
 
 use p9_core::engine::Engine;
 use p9_core::events::{RenderEvent, RenderMode};
-use p9_core::model::SynthWaveform;
+use p9_core::model::{SamplerRenderVariant, SynthWaveform};
 use p9_core::scheduler::Scheduler;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,6 +55,9 @@ struct ActiveVoice {
     note: u8,
     waveform: SynthWaveform,
     mode: VoiceRenderMode,
+    sampler_variant: SamplerRenderVariant,
+    sampler_transient_level: f32,
+    sampler_body_level: f32,
     phase: f32,
     phase_inc: f32,
     amplitude: f32,
@@ -142,6 +145,9 @@ fn apply_event(voices: &mut Vec<ActiveVoice>, event: &RenderEvent, sample_rate_h
             note,
             velocity,
             render_mode,
+            sampler_variant,
+            sampler_transient_level,
+            sampler_body_level,
             waveform,
             attack_ms,
             release_ms,
@@ -172,6 +178,9 @@ fn apply_event(voices: &mut Vec<ActiveVoice>, event: &RenderEvent, sample_rate_h
                 note: *note,
                 waveform: *waveform,
                 mode,
+                sampler_variant: *sampler_variant,
+                sampler_transient_level: *sampler_transient_level as f32 / 127.0,
+                sampler_body_level: *sampler_body_level as f32 / 127.0,
                 phase: 0.0,
                 phase_inc,
                 amplitude: (velocity_gain * instrument_gain * mode_gain).clamp(0.0, 1.0),
@@ -235,9 +244,24 @@ fn oscillator_sample(voice: &ActiveVoice) -> f32 {
         VoiceRenderMode::SamplerV1 => {
             let base = waveform_sample(voice.waveform, voice.phase);
             let sine = voice.phase.sin();
-            let body = (base * 0.65) + (sine * 0.35);
+            let (variant_base_mix, variant_sine_mix, variant_transient_scale) = match voice
+                .sampler_variant
+            {
+                SamplerRenderVariant::Classic => (0.65, 0.35, 1.0),
+                SamplerRenderVariant::Punch => (0.58, 0.42, 1.25),
+                SamplerRenderVariant::Air => (0.76, 0.24, 0.85),
+            };
+            let body_mix = voice.sampler_body_level.clamp(0.0, 1.0);
+            let transient_mix = voice.sampler_transient_level.clamp(0.0, 1.0);
+            let base_weight = (variant_base_mix * body_mix).clamp(0.0, 1.0);
+            let sine_weight = (variant_sine_mix * (1.0 - body_mix * 0.5)).clamp(0.0, 1.0);
+            let weight_sum = (base_weight + sine_weight).max(1e-6);
+            let body = ((base * base_weight) + (sine * sine_weight)) / weight_sum;
             let transient_window = (1.0 - (voice.elapsed_samples as f32 / 96.0)).clamp(0.0, 1.0);
-            let transient = transient_window * ((voice.phase * 2.0).sin().abs() * 2.0 - 1.0);
+            let transient = transient_window
+                * ((voice.phase * 2.0).sin().abs() * 2.0 - 1.0)
+                * transient_mix
+                * variant_transient_scale;
             (body + transient * 0.25).clamp(-1.0, 1.0)
         }
     }
@@ -540,6 +564,9 @@ mod tests {
             attack_ms: 5,
             release_ms: 80,
             gain: 100,
+            sampler_variant: p9_core::model::SamplerRenderVariant::Classic,
+            sampler_transient_level: 64,
+            sampler_body_level: 96,
         };
 
         apply_event(&mut voices, &event, 48_000.0);
@@ -564,6 +591,9 @@ mod tests {
             attack_ms: 9,
             release_ms: 9,
             gain: 100,
+            sampler_variant: p9_core::model::SamplerRenderVariant::Classic,
+            sampler_transient_level: 64,
+            sampler_body_level: 96,
         };
         let sampler_event = RenderEvent::NoteOn {
             track_id: 0,
@@ -575,6 +605,9 @@ mod tests {
             attack_ms: 9,
             release_ms: 9,
             gain: 100,
+            sampler_variant: p9_core::model::SamplerRenderVariant::Punch,
+            sampler_transient_level: 110,
+            sampler_body_level: 40,
         };
 
         apply_event(&mut synth_voices, &synth_event, 48_000.0);
@@ -590,5 +623,141 @@ mod tests {
         assert!(!synth_voices.is_empty());
         assert!(!sampler_voices.is_empty());
         assert_ne!(synth_energy, sampler_energy);
+    }
+
+    #[test]
+    fn long_mixed_mode_session_is_deterministic_and_variant_sensitive() {
+        fn mixed_session_signature(
+            sampler_variant: p9_core::model::SamplerRenderVariant,
+            sampler_transient_level: u8,
+            sampler_body_level: u8,
+        ) -> (i64, i16) {
+            let mut voices = Vec::new();
+            let mut signature = 0.0f64;
+            let mut peak = 0.0f32;
+
+            for tick in 0u32..128 {
+                if tick % 4 == 0 {
+                    apply_event(
+                        &mut voices,
+                        &RenderEvent::NoteOn {
+                            track_id: 0,
+                            note: 48 + (tick % 12) as u8,
+                            velocity: 100,
+                            render_mode: RenderMode::Synth,
+                            instrument_id: Some(0),
+                            waveform: p9_core::model::SynthWaveform::Saw,
+                            attack_ms: 5,
+                            release_ms: 64,
+                            gain: 100,
+                            sampler_variant: p9_core::model::SamplerRenderVariant::Classic,
+                            sampler_transient_level: 64,
+                            sampler_body_level: 96,
+                        },
+                        48_000.0,
+                    );
+                }
+
+                if tick % 4 == 2 {
+                    apply_event(
+                        &mut voices,
+                        &RenderEvent::NoteOff {
+                            track_id: 0,
+                            note: 48 + (tick % 12) as u8,
+                        },
+                        48_000.0,
+                    );
+                }
+
+                if tick % 5 == 0 {
+                    apply_event(
+                        &mut voices,
+                        &RenderEvent::NoteOn {
+                            track_id: 1,
+                            note: 60 + (tick % 7) as u8,
+                            velocity: 108,
+                            render_mode: RenderMode::SamplerV1,
+                            instrument_id: Some(1),
+                            waveform: p9_core::model::SynthWaveform::Saw,
+                            attack_ms: 1,
+                            release_ms: 48,
+                            gain: 100,
+                            sampler_variant,
+                            sampler_transient_level,
+                            sampler_body_level,
+                        },
+                        48_000.0,
+                    );
+                }
+
+                if tick % 5 == 3 {
+                    apply_event(
+                        &mut voices,
+                        &RenderEvent::NoteOff {
+                            track_id: 1,
+                            note: 60 + (tick % 7) as u8,
+                        },
+                        48_000.0,
+                    );
+                }
+
+                if tick % 7 == 0 {
+                    apply_event(
+                        &mut voices,
+                        &RenderEvent::NoteOn {
+                            track_id: 2,
+                            note: 36,
+                            velocity: 120,
+                            render_mode: RenderMode::ExternalMuted,
+                            instrument_id: Some(2),
+                            waveform: p9_core::model::SynthWaveform::Square,
+                            attack_ms: 1,
+                            release_ms: 1,
+                            gain: 110,
+                            sampler_variant: p9_core::model::SamplerRenderVariant::Classic,
+                            sampler_transient_level: 64,
+                            sampler_body_level: 64,
+                        },
+                        48_000.0,
+                    );
+                }
+
+                if tick % 7 == 1 {
+                    apply_event(
+                        &mut voices,
+                        &RenderEvent::NoteOff {
+                            track_id: 2,
+                            note: 36,
+                        },
+                        48_000.0,
+                    );
+                }
+
+                for frame in 0u32..24 {
+                    let sample = synthesize_sample(&mut voices);
+                    let weight = (tick * 24 + frame + 1) as f64;
+                    signature += sample as f64 * weight;
+                    peak = peak.max(sample.abs());
+                }
+            }
+
+            (((signature * 1_000_000.0).round() as i64), (peak * i16::MAX as f32) as i16)
+        }
+
+        let baseline = mixed_session_signature(
+            p9_core::model::SamplerRenderVariant::Punch,
+            112,
+            44,
+        );
+        let repeat = mixed_session_signature(
+            p9_core::model::SamplerRenderVariant::Punch,
+            112,
+            44,
+        );
+        let altered = mixed_session_signature(p9_core::model::SamplerRenderVariant::Air, 52, 116);
+
+        assert_eq!(baseline, repeat);
+        assert_ne!(baseline, altered);
+        assert!(baseline.1 > 0);
     }
 }

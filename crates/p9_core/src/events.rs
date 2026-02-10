@@ -1,4 +1,4 @@
-use crate::model::{InstrumentId, SynthWaveform};
+use crate::model::{InstrumentId, SamplerRenderVariant, SynthWaveform};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RenderMode {
@@ -19,6 +19,9 @@ pub enum RenderEvent {
         attack_ms: u16,
         release_ms: u16,
         gain: u8,
+        sampler_variant: SamplerRenderVariant,
+        sampler_transient_level: u8,
+        sampler_body_level: u8,
     },
     NoteOff {
         track_id: u8,

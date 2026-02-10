@@ -1,8 +1,8 @@
 use crate::engine::Engine;
 use crate::events::{RenderEvent, RenderMode};
 use crate::model::{
-    ChainId, FxCommand, InstrumentId, InstrumentType, ProjectData, Scale, SynthParams,
-    PHRASE_STEP_COUNT, SONG_ROW_COUNT, TRACK_COUNT,
+    ChainId, FxCommand, InstrumentId, InstrumentType, ProjectData, SamplerRenderParams, Scale,
+    SynthParams, PHRASE_STEP_COUNT, SONG_ROW_COUNT, TRACK_COUNT,
 };
 
 #[derive(Clone, Debug, Default)]
@@ -21,6 +21,7 @@ struct StepPlaybackData {
     note: u8,
     velocity: u8,
     render_mode: RenderMode,
+    sampler_render: SamplerRenderParams,
     instrument_id: Option<InstrumentId>,
     note_length_steps: u8,
     synth_params: SynthParams,
@@ -31,6 +32,7 @@ struct InstrumentPlaybackProfile {
     note_length_steps: u8,
     synth_params: SynthParams,
     render_mode: RenderMode,
+    sampler_render: SamplerRenderParams,
 }
 
 pub struct Scheduler {
@@ -148,6 +150,9 @@ impl Scheduler {
             attack_ms: step_data.synth_params.attack_ms,
             release_ms: step_data.synth_params.release_ms,
             gain: step_data.synth_params.gain,
+            sampler_variant: step_data.sampler_render.variant,
+            sampler_transient_level: step_data.sampler_render.transient_level,
+            sampler_body_level: step_data.sampler_render.body_level,
         });
 
         let state = &mut self.track_state[track_index];
@@ -223,6 +228,7 @@ impl Scheduler {
         let mut velocity = step.velocity;
         let profile = self.resolve_instrument_profile(project, step.instrument_id);
         let render_mode = profile.render_mode;
+        let sampler_render = profile.sampler_render;
         let mut note_length_steps = profile.note_length_steps;
         let synth_params = profile.synth_params;
 
@@ -259,6 +265,7 @@ impl Scheduler {
             note,
             velocity,
             render_mode,
+            sampler_render,
             instrument_id: step.instrument_id,
             note_length_steps,
             synth_params,
@@ -275,11 +282,13 @@ impl Scheduler {
                 note_length_steps: 1,
                 synth_params: SynthParams::default(),
                 render_mode: RenderMode::Synth,
+                sampler_render: SamplerRenderParams::default(),
             };
         };
 
         let mut note_length_steps = instrument.note_length_steps.max(1);
         let mut synth_params = instrument.synth_params;
+        let mut sampler_render = instrument.sampler_render.unwrap_or_default();
         let render_mode = match instrument.instrument_type {
             InstrumentType::Synth | InstrumentType::None => RenderMode::Synth,
             InstrumentType::Sampler => RenderMode::SamplerV1,
@@ -293,6 +302,8 @@ impl Scheduler {
                 synth_params.attack_ms = synth_params.attack_ms.min(1);
                 synth_params.release_ms = synth_params.release_ms.max(24);
                 note_length_steps = note_length_steps.max(2);
+                sampler_render.transient_level = sampler_render.transient_level.min(127);
+                sampler_render.body_level = sampler_render.body_level.min(127);
             }
             InstrumentType::MidiOut | InstrumentType::External => {
                 // External destinations should not produce duplicated internal voice output.
@@ -310,6 +321,7 @@ impl Scheduler {
             note_length_steps,
             synth_params,
             render_mode,
+            sampler_render,
         }
     }
 
@@ -549,7 +561,10 @@ mod tests {
     use super::Scheduler;
     use crate::engine::{Engine, EngineCommand};
     use crate::events::{RenderEvent, RenderMode};
-    use crate::model::{Chain, FxCommand, Groove, Instrument, InstrumentType, Phrase, Scale, Table};
+    use crate::model::{
+        Chain, FxCommand, Groove, Instrument, InstrumentType, Phrase, SamplerRenderParams,
+        SamplerRenderVariant, Scale, Table,
+    };
 
     fn setup_engine() -> Engine {
         let mut engine = Engine::new("test");
@@ -1083,6 +1098,57 @@ mod tests {
         assert_eq!(note_on.1, 1);
         assert_eq!(note_on.2, 16);
         assert_eq!(note_on.3, 0);
+    }
+
+    #[test]
+    fn sampler_render_params_are_forwarded_to_render_event() {
+        let mut engine = setup_engine();
+        let mut sampler = Instrument::new(0, InstrumentType::Sampler, "Sampler");
+        sampler.sampler_render = Some(SamplerRenderParams {
+            variant: SamplerRenderVariant::Air,
+            transient_level: 99,
+            body_level: 31,
+        });
+        engine
+            .apply_command(EngineCommand::UpsertInstrument {
+                instrument: sampler,
+            })
+            .unwrap();
+        engine
+            .apply_command(EngineCommand::SetPhraseStep {
+                phrase_id: 0,
+                step_index: 0,
+                note: Some(60),
+                velocity: 100,
+                instrument_id: Some(0),
+            })
+            .unwrap();
+
+        let mut scheduler = Scheduler::new(4);
+        let events = scheduler.tick(&engine);
+        let note_on = events
+            .iter()
+            .find_map(|event| match event {
+                RenderEvent::NoteOn {
+                    render_mode,
+                    sampler_variant,
+                    sampler_transient_level,
+                    sampler_body_level,
+                    ..
+                } => Some((
+                    *render_mode,
+                    *sampler_variant,
+                    *sampler_transient_level,
+                    *sampler_body_level,
+                )),
+                _ => None,
+            })
+            .expect("expected sampler note on");
+
+        assert_eq!(note_on.0, RenderMode::SamplerV1);
+        assert_eq!(note_on.1, SamplerRenderVariant::Air);
+        assert_eq!(note_on.2, 99);
+        assert_eq!(note_on.3, 31);
     }
 
     fn count_note_on(events: &[RenderEvent]) -> usize {

@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
 use p9_core::model::{
-    Chain, FxCommand, Groove, Instrument, InstrumentType, ProjectData, Scale, SynthWaveform,
-    Table, CHAIN_ROW_COUNT, PHRASE_STEP_COUNT, SONG_ROW_COUNT, TRACK_COUNT,
+    Chain, FxCommand, Groove, Instrument, InstrumentType, ProjectData, SamplerRenderVariant,
+    Scale, SynthWaveform, Table, CHAIN_ROW_COUNT, PHRASE_STEP_COUNT, SONG_ROW_COUNT, TRACK_COUNT,
 };
 
 pub const FORMAT_VERSION: u16 = 2;
@@ -56,6 +56,9 @@ struct InstrumentPatch {
     synth_attack_ms: Option<u16>,
     synth_release_ms: Option<u16>,
     synth_gain: Option<u8>,
+    sampler_variant: Option<SamplerRenderVariant>,
+    sampler_transient_level: Option<u8>,
+    sampler_body_level: Option<u8>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -250,6 +253,21 @@ impl ProjectEnvelope {
                     "instrument.{}.synth.gain={}",
                     instrument_id, instrument.synth_params.gain
                 ));
+                if let Some(sampler_render) = instrument.sampler_render {
+                    lines.push(format!(
+                        "instrument.{}.sampler.variant={}",
+                        instrument_id,
+                        render_sampler_variant(sampler_render.variant)
+                    ));
+                    lines.push(format!(
+                        "instrument.{}.sampler.transient_level={}",
+                        instrument_id, sampler_render.transient_level
+                    ));
+                    lines.push(format!(
+                        "instrument.{}.sampler.body_level={}",
+                        instrument_id, sampler_render.body_level
+                    ));
+                }
             }
         }
 
@@ -488,6 +506,17 @@ impl ProjectEnvelope {
                     InstrumentField::SynthGain => {
                         patch.synth_gain = Some(parse_u8(value, "instrument.synth.gain")?);
                     }
+                    InstrumentField::SamplerVariant => {
+                        patch.sampler_variant = Some(parse_sampler_variant(value)?);
+                    }
+                    InstrumentField::SamplerTransientLevel => {
+                        patch.sampler_transient_level =
+                            Some(parse_u8(value, "instrument.sampler.transient_level")?);
+                    }
+                    InstrumentField::SamplerBodyLevel => {
+                        patch.sampler_body_level =
+                            Some(parse_u8(value, "instrument.sampler.body_level")?);
+                    }
                 }
                 continue;
             }
@@ -717,6 +746,22 @@ impl ProjectEnvelope {
             if let Some(gain) = patch.synth_gain {
                 instrument.synth_params.gain = gain;
             }
+            if patch.sampler_variant.is_some()
+                || patch.sampler_transient_level.is_some()
+                || patch.sampler_body_level.is_some()
+            {
+                let mut sampler_render = instrument.sampler_render.unwrap_or_default();
+                if let Some(variant) = patch.sampler_variant {
+                    sampler_render.variant = variant;
+                }
+                if let Some(level) = patch.sampler_transient_level {
+                    sampler_render.transient_level = level;
+                }
+                if let Some(level) = patch.sampler_body_level {
+                    sampler_render.body_level = level;
+                }
+                instrument.sampler_render = Some(sampler_render);
+            }
         }
 
         for ((table_id, row_idx), patch) in table_row_patches {
@@ -898,6 +943,25 @@ fn parse_waveform(value: &str) -> Result<SynthWaveform, StorageError> {
     }
 }
 
+fn render_sampler_variant(variant: SamplerRenderVariant) -> &'static str {
+    match variant {
+        SamplerRenderVariant::Classic => "classic",
+        SamplerRenderVariant::Punch => "punch",
+        SamplerRenderVariant::Air => "air",
+    }
+}
+
+fn parse_sampler_variant(value: &str) -> Result<SamplerRenderVariant, StorageError> {
+    match value.to_ascii_lowercase().as_str() {
+        "classic" => Ok(SamplerRenderVariant::Classic),
+        "punch" => Ok(SamplerRenderVariant::Punch),
+        "air" => Ok(SamplerRenderVariant::Air),
+        _ => Err(StorageError::ParseError(
+            "instrument.sampler.variant".to_string(),
+        )),
+    }
+}
+
 enum TrackField {
     Mute,
     Solo,
@@ -1052,6 +1116,9 @@ enum InstrumentField {
     SynthAttackMs,
     SynthReleaseMs,
     SynthGain,
+    SamplerVariant,
+    SamplerTransientLevel,
+    SamplerBodyLevel,
 }
 
 fn parse_instrument_field(key: &str) -> Result<Option<(u8, InstrumentField)>, StorageError> {
@@ -1093,6 +1160,16 @@ fn parse_instrument_field(key: &str) -> Result<Option<(u8, InstrumentField)>, St
             "attack_ms" => InstrumentField::SynthAttackMs,
             "release_ms" => InstrumentField::SynthReleaseMs,
             "gain" => InstrumentField::SynthGain,
+            _ => return Ok(None),
+        };
+        return Ok(Some((instrument_id, field)));
+    }
+
+    if parts.len() == 4 && parts[2] == "sampler" {
+        let field = match parts[3] {
+            "variant" => InstrumentField::SamplerVariant,
+            "transient_level" => InstrumentField::SamplerTransientLevel,
+            "body_level" => InstrumentField::SamplerBodyLevel,
             _ => return Ok(None),
         };
         return Ok(Some((instrument_id, field)));
@@ -1243,8 +1320,8 @@ fn parse_scale_field(key: &str) -> Result<Option<(u8, ScaleField)>, StorageError
 mod tests {
     use super::{ProjectEnvelope, StorageError, FORMAT_VERSION};
     use p9_core::model::{
-        Chain, FxCommand, Groove, Instrument, InstrumentType, ProjectData, Scale, SynthWaveform,
-        Table,
+        Chain, FxCommand, Groove, Instrument, InstrumentType, ProjectData, SamplerRenderParams,
+        SamplerRenderVariant, Scale, SynthWaveform, Table,
     };
 
     #[test]
@@ -1372,6 +1449,14 @@ mod tests {
         instrument.synth_params.gain = 87;
         project.instruments.insert(3, instrument);
 
+        let mut sampler = Instrument::new(4, InstrumentType::Sampler, "Drum");
+        sampler.sampler_render = Some(SamplerRenderParams {
+            variant: SamplerRenderVariant::Punch,
+            transient_level: 112,
+            body_level: 44,
+        });
+        project.instruments.insert(4, sampler);
+
         let mut table = Table::new(7);
         table.rows[0].note_offset = 3;
         table.rows[0].volume = 90;
@@ -1413,6 +1498,13 @@ mod tests {
         assert_eq!(instrument.synth_params.attack_ms, 12);
         assert_eq!(instrument.synth_params.release_ms, 240);
         assert_eq!(instrument.synth_params.gain, 87);
+
+        let sampler = restored.project.instruments.get(&4).unwrap();
+        assert_eq!(sampler.instrument_type, InstrumentType::Sampler);
+        let sampler_render = sampler.sampler_render.expect("sampler render params");
+        assert_eq!(sampler_render.variant, SamplerRenderVariant::Punch);
+        assert_eq!(sampler_render.transient_level, 112);
+        assert_eq!(sampler_render.body_level, 44);
 
         let table = restored.project.tables.get(&7).unwrap();
         assert_eq!(table.rows[0].note_offset, 3);

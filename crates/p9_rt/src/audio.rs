@@ -217,6 +217,7 @@ impl AudioBackend for NativeAudioBackend {
                     attack_ms,
                     release_ms,
                     gain,
+                    ..
                 } => {
                     if *gain == 0 || matches!(render_mode, RenderMode::ExternalMuted) {
                         self.silent_note_on_total = self.silent_note_on_total.saturating_add(1);
@@ -353,6 +354,9 @@ mod tests {
             attack_ms: 5,
             release_ms: 80,
             gain: 100,
+            sampler_variant: p9_core::model::SamplerRenderVariant::Classic,
+            sampler_transient_level: 64,
+            sampler_body_level: 96,
         }
     }
 
@@ -442,6 +446,9 @@ mod tests {
             attack_ms: 0,
             release_ms: 1,
             gain: 100,
+            sampler_variant: p9_core::model::SamplerRenderVariant::Classic,
+            sampler_transient_level: 64,
+            sampler_body_level: 96,
         }]);
         backend.push_events(&[RenderEvent::NoteOn {
             track_id: 0,
@@ -453,6 +460,9 @@ mod tests {
             attack_ms: 4,
             release_ms: 1,
             gain: 100,
+            sampler_variant: p9_core::model::SamplerRenderVariant::Classic,
+            sampler_transient_level: 64,
+            sampler_body_level: 96,
         }]);
         backend.push_events(&[RenderEvent::NoteOff {
             track_id: 0,
@@ -496,6 +506,9 @@ mod tests {
             attack_ms: 5,
             release_ms: 40,
             gain: 100,
+            sampler_variant: p9_core::model::SamplerRenderVariant::Classic,
+            sampler_transient_level: 64,
+            sampler_body_level: 96,
         }]);
         backend.push_events(&[RenderEvent::NoteOff {
             track_id: 0,
@@ -566,6 +579,9 @@ mod tests {
             attack_ms: 1,
             release_ms: 24,
             gain: 0,
+            sampler_variant: p9_core::model::SamplerRenderVariant::Classic,
+            sampler_transient_level: 64,
+            sampler_body_level: 96,
         }]);
 
         let metrics = backend.metrics();
@@ -590,6 +606,9 @@ mod tests {
             attack_ms: 1,
             release_ms: 32,
             gain: 100,
+            sampler_variant: p9_core::model::SamplerRenderVariant::Punch,
+            sampler_transient_level: 110,
+            sampler_body_level: 40,
         }]);
 
         let metrics = backend.metrics();

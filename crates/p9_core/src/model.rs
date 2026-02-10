@@ -29,6 +29,30 @@ pub enum SynthWaveform {
     Triangle,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SamplerRenderVariant {
+    Classic,
+    Punch,
+    Air,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SamplerRenderParams {
+    pub variant: SamplerRenderVariant,
+    pub transient_level: u8,
+    pub body_level: u8,
+}
+
+impl Default for SamplerRenderParams {
+    fn default() -> Self {
+        Self {
+            variant: SamplerRenderVariant::Classic,
+            transient_level: 64,
+            body_level: 96,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct SynthParams {
     pub waveform: SynthWaveform,
@@ -161,6 +185,7 @@ pub struct Instrument {
     pub table_id: Option<TableId>,
     pub note_length_steps: u8,
     pub synth_params: SynthParams,
+    pub sampler_render: Option<SamplerRenderParams>,
 }
 
 impl Instrument {
@@ -173,6 +198,7 @@ impl Instrument {
             table_id: None,
             note_length_steps: 1,
             synth_params: SynthParams::default(),
+            sampler_render: None,
         }
     }
 }
