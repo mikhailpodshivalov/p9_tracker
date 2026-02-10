@@ -1,4 +1,5 @@
 mod hardening;
+mod gui_shell;
 mod runtime;
 mod ui;
 mod ui_shell;
@@ -14,7 +15,9 @@ use runtime::{RuntimeCommand, RuntimeCoordinator, SyncMode};
 use ui::{UiAction, UiController};
 
 fn main() {
-    let ui_shell_mode = std::env::args().any(|arg| arg == "--ui-shell");
+    let args: Vec<String> = std::env::args().collect();
+    let ui_shell_mode = args.iter().any(|arg| arg == "--ui-shell");
+    let gui_shell_mode = args.iter().any(|arg| arg == "--gui-shell");
 
     let mut engine = Engine::new("p9_tracker song");
     let _ = engine.apply_command(EngineCommand::SetTempo(128));
@@ -189,6 +192,13 @@ fn main() {
         reverb: 40,
     });
 
+    if gui_shell_mode {
+        if let Err(err) = gui_shell::run_web_shell(&mut ui, &mut engine, &mut runtime) {
+            eprintln!("p9_tracker gui-shell failed: {err}");
+        }
+        return;
+    }
+
     if ui_shell_mode {
         ui_shell::run_interactive_shell(&mut ui, &mut engine, &mut runtime)
             .expect("ui shell failed");
@@ -308,7 +318,7 @@ fn main() {
         .expect("autosave failed");
 
     println!(
-        "p9_tracker stage16.4 workflow-hardening-regression: tempo={}, restored_tempo={}, ticks={}, playing={}, sync_mode={:?}, external_clock_pending={}, events={}, audio_events={}, midi_events={}, midi_clock_events={}, midi_ingested={}, midi_out_messages={}, processed_commands={}, backend={}, fallback={}, callbacks={}, xruns={}, last_callback_us={}, avg_callback_us={}, sample_rate={}, buffer_size={}, active_voices={}, max_voices={}, voice_steals={}, ui_screen={:?}, ui_track={}, ui_song_row={}, ui_chain_row={}, ui_phrase={}, ui_step={}, ui_scale_highlight={:?}, ui_track_level={}, export_ticks={}, export_events={}, export_samples={}, export_peak={}, export_path={}, autosave_written={}, autosave_tick={}, autosave_path={}, ui_shell_mode_supported={}",
+        "p9_tracker stage17.1 gui-stack-app-shell: tempo={}, restored_tempo={}, ticks={}, playing={}, sync_mode={:?}, external_clock_pending={}, events={}, audio_events={}, midi_events={}, midi_clock_events={}, midi_ingested={}, midi_out_messages={}, processed_commands={}, backend={}, fallback={}, callbacks={}, xruns={}, last_callback_us={}, avg_callback_us={}, sample_rate={}, buffer_size={}, active_voices={}, max_voices={}, voice_steals={}, ui_screen={:?}, ui_track={}, ui_song_row={}, ui_chain_row={}, ui_phrase={}, ui_step={}, ui_scale_highlight={:?}, ui_track_level={}, export_ticks={}, export_events={}, export_samples={}, export_peak={}, export_path={}, autosave_written={}, autosave_tick={}, autosave_path={}, ui_shell_mode_supported={}",
         envelope.project.song.tempo,
         restored.project.song.tempo,
         transport.tick,

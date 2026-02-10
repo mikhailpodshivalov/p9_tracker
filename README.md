@@ -2,7 +2,7 @@
 
 ## Status
 
-- Current stage: `Phase 16.4 workflow hardening and regression pack completed`
+- Current stage: `Phase 17.1 GUI stack and app shell completed`
 - Main implementation stack: `Rust`
 
 ## Phase 1 Artifacts
@@ -89,6 +89,10 @@
 - `docs/phase16_2_selection_block_ops.md`
 - `docs/phase16_3_dirty_recovery_entry.md`
 - `docs/phase16_4_workflow_hardening_regression.md`
+
+## Phase 17.1 Artifacts
+
+- `docs/phase17_1_gui_stack_app_shell.md`
 
 ## Forward Plan
 
