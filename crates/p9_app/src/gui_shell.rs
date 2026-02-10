@@ -10,10 +10,11 @@ use crate::hardening::{
 };
 use crate::runtime::{RuntimeCommand, RuntimeCoordinator};
 use crate::ui_shell::{
-    apply_shell_command_with_history_state, ProjectHistory, ShellCommandResult, ShellEditState,
+    apply_shell_command_with_history_state, ProjectHistory, SelectionRange, ShellCommandResult,
+    ShellEditState,
 };
 use crate::ui::{UiAction, UiController, UiError, UiScreen, UiSnapshot};
-use p9_core::engine::Engine;
+use p9_core::engine::{Engine, EngineCommand};
 use p9_core::model::{ProjectData, Step, CHAIN_ROW_COUNT, PHRASE_STEP_COUNT, SONG_ROW_COUNT};
 use p9_rt::audio::{AudioBackend, NoopAudioBackend};
 use p9_rt::midi::NoopMidiOutput;
@@ -95,7 +96,7 @@ pub fn run_web_shell(
     listener.set_nonblocking(true)?;
 
     println!(
-        "p9_tracker gui-shell stage18.2 running at http://{}",
+        "p9_tracker gui-shell stage18.3 running at http://{}",
         listener.local_addr()?
     );
     println!("Open this URL in browser. Press Ctrl+C or click Quit GUI Shell to stop.");
@@ -506,6 +507,81 @@ fn apply_gui_command_with_query(
         "edit_redo" => {
             return run_shell_edit_command("y", ui, engine, runtime, history, edit_state);
         }
+        "edit_power_duplicate" => {
+            return apply_power_duplicate(
+                query, ui, engine, runtime, history, edit_state,
+            );
+        }
+        "edit_power_fill" => {
+            return apply_power_fill(
+                query, ui, engine, runtime, history, edit_state,
+            );
+        }
+        "edit_power_clear_range" => {
+            return apply_power_clear_range(
+                ui, engine, runtime, history, edit_state,
+            );
+        }
+        "edit_power_transpose" => {
+            return apply_power_transpose(
+                query, ui, engine, runtime, history, edit_state,
+            );
+        }
+        "edit_power_transpose_up" => {
+            return apply_power_transpose(
+                Some("delta=1"),
+                ui,
+                engine,
+                runtime,
+                history,
+                edit_state,
+            );
+        }
+        "edit_power_transpose_down" => {
+            return apply_power_transpose(
+                Some("delta=-1"),
+                ui,
+                engine,
+                runtime,
+                history,
+                edit_state,
+            );
+        }
+        "edit_power_rotate" => {
+            return apply_power_rotate(
+                query, ui, engine, runtime, history, edit_state,
+            );
+        }
+        "edit_power_rotate_right" => {
+            return apply_power_rotate(
+                Some("shift=1"),
+                ui,
+                engine,
+                runtime,
+                history,
+                edit_state,
+            );
+        }
+        "edit_power_rotate_left" => {
+            return apply_power_rotate(
+                Some("shift=-1"),
+                ui,
+                engine,
+                runtime,
+                history,
+                edit_state,
+            );
+        }
+        "edit_song_clone_prev" => {
+            return apply_song_clone_prev(
+                ui, engine, runtime, history,
+            );
+        }
+        "edit_chain_clone_prev" => {
+            return apply_chain_clone_prev(
+                ui, engine, runtime, history,
+            );
+        }
         "edit_write_step" => {
             let custom_edit = query_flag(query, "clear")
                 || query_value(query, "note").is_some()
@@ -623,6 +699,342 @@ fn run_shell_edit_command(
         Ok(ShellCommandResult::Exit) => String::from("warn: exit command ignored in gui shell"),
         Err(err) => format!("error: action '{command}' failed: {}", ui_error_label(err)),
     }
+}
+
+fn apply_power_duplicate(
+    query: Option<&str>,
+    ui: &mut UiController,
+    engine: &mut Engine,
+    runtime: &mut RuntimeCoordinator,
+    history: &mut ProjectHistory,
+    edit_state: &mut ShellEditState,
+) -> String {
+    let snapshot = ui.snapshot(engine, runtime);
+    let selection = match resolve_selection_range(engine.snapshot(), snapshot, edit_state) {
+        Ok(selection) => selection,
+        Err(status) => return status,
+    };
+    let target_step = selection.end_step + 1;
+    if target_step >= PHRASE_STEP_COUNT {
+        return String::from("warn: duplicate target out of range; move selection earlier");
+    }
+
+    if let Err(err) = ui.handle_action(UiAction::SelectStep(target_step), engine, runtime) {
+        return format!(
+            "error: action 'edit_power_duplicate' failed: {}",
+            ui_error_label(err)
+        );
+    }
+
+    let copy_status = run_shell_edit_command("w", ui, engine, runtime, history, edit_state);
+    if !copy_status.starts_with("info:") {
+        return copy_status;
+    }
+
+    let paste_status = run_shell_edit_command("v", ui, engine, runtime, history, edit_state);
+    if query_flag(query, "force")
+        && paste_status.starts_with("warn:")
+        && paste_status.contains("run V")
+    {
+        return run_shell_edit_command("V", ui, engine, runtime, history, edit_state);
+    }
+
+    paste_status
+}
+
+fn apply_power_fill(
+    query: Option<&str>,
+    ui: &mut UiController,
+    engine: &mut Engine,
+    runtime: &mut RuntimeCoordinator,
+    history: &mut ProjectHistory,
+    edit_state: &mut ShellEditState,
+) -> String {
+    let snapshot = ui.snapshot(engine, runtime);
+    let selection = match resolve_selection_range(engine.snapshot(), snapshot, edit_state) {
+        Ok(selection) => selection,
+        Err(status) => return status,
+    };
+
+    let instrument_id = query_value(query, "instrument")
+        .and_then(parse_u8_field)
+        .unwrap_or(snapshot.focused_track as u8);
+    if !engine.snapshot().instruments.contains_key(&instrument_id) {
+        return format!(
+            "warn: instrument {} missing; run edit_ensure_instrument first",
+            instrument_id
+        );
+    }
+    let velocity = query_value(query, "velocity")
+        .and_then(parse_u8_field)
+        .unwrap_or(100)
+        .max(1);
+    let note_override = query_value(query, "note").and_then(parse_u8_field);
+
+    let before = engine.snapshot().clone();
+    if let Err(err) = ui.handle_action(UiAction::SelectPhrase(selection.phrase_id), engine, runtime) {
+        return format!("error: action 'edit_power_fill' failed: {}", ui_error_label(err));
+    }
+
+    for step_index in selection.start_step..=selection.end_step {
+        let note = note_override.unwrap_or_else(|| seeded_note(step_index));
+        if let Err(err) = ui.handle_action(
+            UiAction::EditStep {
+                phrase_id: selection.phrase_id,
+                step_index,
+                note: Some(note),
+                velocity,
+                instrument_id: Some(instrument_id),
+            },
+            engine,
+            runtime,
+        ) {
+            return format!("error: action 'edit_power_fill' failed: {}", ui_error_label(err));
+        }
+    }
+
+    history.record_change(before);
+    if let Some(note) = note_override {
+        format!(
+            "info: fill -> phrase {} steps {:02}-{:02} note {} vel {} ins {}",
+            selection.phrase_id, selection.start_step, selection.end_step, note, velocity, instrument_id
+        )
+    } else {
+        format!(
+            "info: fill -> phrase {} steps {:02}-{:02} seeded vel {} ins {}",
+            selection.phrase_id, selection.start_step, selection.end_step, velocity, instrument_id
+        )
+    }
+}
+
+fn apply_power_clear_range(
+    ui: &mut UiController,
+    engine: &mut Engine,
+    runtime: &mut RuntimeCoordinator,
+    history: &mut ProjectHistory,
+    edit_state: &mut ShellEditState,
+) -> String {
+    let snapshot = ui.snapshot(engine, runtime);
+    let selection = match resolve_selection_range(engine.snapshot(), snapshot, edit_state) {
+        Ok(selection) => selection,
+        Err(status) => return status,
+    };
+
+    let before = engine.snapshot().clone();
+    if let Err(err) = ui.handle_action(UiAction::SelectPhrase(selection.phrase_id), engine, runtime) {
+        return format!(
+            "error: action 'edit_power_clear_range' failed: {}",
+            ui_error_label(err)
+        );
+    }
+    for step_index in selection.start_step..=selection.end_step {
+        if let Err(err) = write_step(engine, selection.phrase_id, step_index, &Step::default()) {
+            return format!(
+                "error: action 'edit_power_clear_range' failed: {}",
+                ui_error_label(err)
+            );
+        }
+    }
+
+    history.record_change(before);
+    format!(
+        "info: clear -> phrase {} steps {:02}-{:02}",
+        selection.phrase_id, selection.start_step, selection.end_step
+    )
+}
+
+fn apply_power_transpose(
+    query: Option<&str>,
+    ui: &mut UiController,
+    engine: &mut Engine,
+    runtime: &mut RuntimeCoordinator,
+    history: &mut ProjectHistory,
+    edit_state: &mut ShellEditState,
+) -> String {
+    let snapshot = ui.snapshot(engine, runtime);
+    let selection = match resolve_selection_range(engine.snapshot(), snapshot, edit_state) {
+        Ok(selection) => selection,
+        Err(status) => return status,
+    };
+
+    let delta = query_value(query, "delta")
+        .and_then(parse_i16_field)
+        .unwrap_or(1)
+        .clamp(-48, 48);
+    if delta == 0 {
+        return String::from("warn: transpose delta is zero; nothing to do");
+    }
+
+    let Some(phrase) = engine.snapshot().phrases.get(&selection.phrase_id) else {
+        return String::from("warn: selected phrase missing; run edit_bind_phrase first");
+    };
+
+    let mut steps = phrase.steps[selection.start_step..=selection.end_step].to_vec();
+    let mut note_count = 0usize;
+    for step in &mut steps {
+        if let Some(note) = step.note {
+            let shifted = (note as i16 + delta).clamp(0, 127) as u8;
+            step.note = Some(shifted);
+            note_count += 1;
+        }
+    }
+    if note_count == 0 {
+        return String::from("warn: transpose skipped; no notes in selection");
+    }
+
+    let before = engine.snapshot().clone();
+    for (offset, step) in steps.iter().enumerate() {
+        if let Err(err) = write_step(engine, selection.phrase_id, selection.start_step + offset, step) {
+            return format!(
+                "error: action 'edit_power_transpose' failed: {}",
+                ui_error_label(err)
+            );
+        }
+    }
+
+    history.record_change(before);
+    format!(
+        "info: transpose -> phrase {} steps {:02}-{:02} delta {:+} notes {}",
+        selection.phrase_id, selection.start_step, selection.end_step, delta, note_count
+    )
+}
+
+fn apply_power_rotate(
+    query: Option<&str>,
+    ui: &mut UiController,
+    engine: &mut Engine,
+    runtime: &mut RuntimeCoordinator,
+    history: &mut ProjectHistory,
+    edit_state: &mut ShellEditState,
+) -> String {
+    let snapshot = ui.snapshot(engine, runtime);
+    let selection = match resolve_selection_range(engine.snapshot(), snapshot, edit_state) {
+        Ok(selection) => selection,
+        Err(status) => return status,
+    };
+
+    let len = selection.end_step - selection.start_step + 1;
+    if len < 2 {
+        return String::from("warn: rotate needs at least two steps selected");
+    }
+    let shift = query_value(query, "shift")
+        .and_then(parse_i16_field)
+        .unwrap_or(1);
+    let normalized = shift.rem_euclid(len as i16) as usize;
+    if normalized == 0 {
+        return String::from("warn: rotate shift is zero for this selection length");
+    }
+
+    let Some(phrase) = engine.snapshot().phrases.get(&selection.phrase_id) else {
+        return String::from("warn: selected phrase missing; run edit_bind_phrase first");
+    };
+    let mut steps = phrase.steps[selection.start_step..=selection.end_step].to_vec();
+    steps.rotate_right(normalized);
+
+    let before = engine.snapshot().clone();
+    for (offset, step) in steps.iter().enumerate() {
+        if let Err(err) = write_step(engine, selection.phrase_id, selection.start_step + offset, step) {
+            return format!("error: action 'edit_power_rotate' failed: {}", ui_error_label(err));
+        }
+    }
+
+    history.record_change(before);
+    format!(
+        "info: rotate -> phrase {} steps {:02}-{:02} shift {:+}",
+        selection.phrase_id, selection.start_step, selection.end_step, shift
+    )
+}
+
+fn apply_song_clone_prev(
+    ui: &mut UiController,
+    engine: &mut Engine,
+    runtime: &mut RuntimeCoordinator,
+    history: &mut ProjectHistory,
+) -> String {
+    let snapshot = ui.snapshot(engine, runtime);
+    if snapshot.selected_song_row == 0 {
+        return String::from("warn: song row 00 has no previous row to clone");
+    }
+
+    let project = engine.snapshot();
+    let Some(track) = project.song.tracks.get(snapshot.focused_track) else {
+        return String::from("error: focused track missing");
+    };
+    let source_chain = track.song_rows[snapshot.selected_song_row - 1];
+    let current_chain = track.song_rows[snapshot.selected_song_row];
+    if source_chain == current_chain {
+        return String::from("warn: song row already matches previous row");
+    }
+
+    let before = project.clone();
+    if let Err(err) = ui.handle_action(
+        UiAction::BindTrackRowToChain {
+            song_row: snapshot.selected_song_row,
+            chain_id: source_chain,
+        },
+        engine,
+        runtime,
+    ) {
+        return format!("error: action 'edit_song_clone_prev' failed: {}", ui_error_label(err));
+    }
+
+    history.record_change(before);
+    format!(
+        "info: song clone -> row {} chain {}",
+        snapshot.selected_song_row,
+        option_u8_label(source_chain)
+    )
+}
+
+fn apply_chain_clone_prev(
+    ui: &mut UiController,
+    engine: &mut Engine,
+    runtime: &mut RuntimeCoordinator,
+    history: &mut ProjectHistory,
+) -> String {
+    let snapshot = ui.snapshot(engine, runtime);
+    if snapshot.selected_chain_row == 0 {
+        return String::from("warn: chain row 00 has no previous row to clone");
+    }
+    let Some(chain_id) = bound_chain_id(engine.snapshot(), snapshot) else {
+        return String::from("warn: no chain on selected song row; run edit_bind_chain first");
+    };
+
+    let Some(chain) = engine.snapshot().chains.get(&chain_id) else {
+        return format!("warn: chain {} missing; run edit_bind_chain first", chain_id);
+    };
+    let source_row = chain.rows[snapshot.selected_chain_row - 1].clone();
+    let current_row = chain.rows[snapshot.selected_chain_row].clone();
+    if source_row.phrase_id == current_row.phrase_id && source_row.transpose == current_row.transpose
+    {
+        return String::from("warn: chain row already matches previous row");
+    }
+
+    let before = engine.snapshot().clone();
+    if let Err(err) = ui.handle_action(
+        UiAction::BindChainRowToPhrase {
+            chain_id,
+            chain_row: snapshot.selected_chain_row,
+            phrase_id: source_row.phrase_id,
+            transpose: source_row.transpose,
+        },
+        engine,
+        runtime,
+    ) {
+        return format!(
+            "error: action 'edit_chain_clone_prev' failed: {}",
+            ui_error_label(err)
+        );
+    }
+
+    history.record_change(before);
+    format!(
+        "info: chain clone -> chain {} row {} phrase {} trn {:+}",
+        chain_id,
+        snapshot.selected_chain_row,
+        option_u8_label(source_row.phrase_id),
+        source_row.transpose
+    )
 }
 
 fn normalize_status(message: String) -> String {
@@ -775,9 +1187,10 @@ fn build_editor_json(project: &ProjectData, snapshot: UiSnapshot, session_state:
     let bound_phrase = bound_phrase_id(project, snapshot);
     let focused_instrument = snapshot.focused_track as u8;
     let instrument_ready = project.instruments.contains_key(&focused_instrument);
+    let selection = session_state.edit_state.selection_range();
 
     format!(
-        "{{\"target\":\"{}\",\"focused_instrument\":{},\"instrument_ready\":{},\"bound_chain_id\":{},\"bound_phrase_id\":{},\"undo_depth\":{},\"redo_depth\":{},\"selection_active\":{},\"clipboard_ready\":{},\"overwrite_guard\":{}}}",
+        "{{\"target\":\"{}\",\"focused_instrument\":{},\"instrument_ready\":{},\"bound_chain_id\":{},\"bound_phrase_id\":{},\"undo_depth\":{},\"redo_depth\":{},\"selection_active\":{},\"selection_start\":{},\"selection_end\":{},\"clipboard_ready\":{},\"clipboard_len\":{},\"overwrite_guard\":{}}}",
         json_escape(&editor_target_label(snapshot, bound_chain, bound_phrase)),
         focused_instrument,
         instrument_ready,
@@ -786,7 +1199,10 @@ fn build_editor_json(project: &ProjectData, snapshot: UiSnapshot, session_state:
         session_state.history.undo_depth(),
         session_state.history.redo_depth(),
         session_state.edit_state.has_selection(),
+        option_usize_json(selection.map(|item| item.start_step)),
+        option_usize_json(selection.map(|item| item.end_step)),
         session_state.edit_state.has_clipboard(),
+        session_state.edit_state.clipboard_len(),
         session_state.edit_state.has_overwrite_guard(),
     )
 }
@@ -948,6 +1364,51 @@ fn bound_phrase_id(project: &ProjectData, snapshot: UiSnapshot) -> Option<u8> {
         .and_then(|row| row.phrase_id)
 }
 
+fn resolve_selection_range(
+    project: &ProjectData,
+    snapshot: UiSnapshot,
+    edit_state: &ShellEditState,
+) -> Result<SelectionRange, String> {
+    let Some(selection) = edit_state.selection_range() else {
+        return Err(String::from("warn: selection start missing; run Select Start first"));
+    };
+    let Some(bound_phrase) = bound_phrase_id(project, snapshot) else {
+        return Err(String::from(
+            "warn: no phrase on selected chain row; run edit_bind_phrase first",
+        ));
+    };
+    if selection.track_index != snapshot.focused_track || selection.phrase_id != bound_phrase {
+        return Err(String::from(
+            "warn: selection scope changed; run Select Start again",
+        ));
+    }
+    Ok(selection)
+}
+
+fn write_step(
+    engine: &mut Engine,
+    phrase_id: u8,
+    step_index: usize,
+    step: &Step,
+) -> Result<(), UiError> {
+    engine.apply_command(EngineCommand::SetPhraseStep {
+        phrase_id,
+        step_index,
+        note: step.note,
+        velocity: step.velocity,
+        instrument_id: step.instrument_id,
+    })?;
+    for (fx_slot, fx) in step.fx.iter().cloned().enumerate() {
+        engine.apply_command(EngineCommand::SetStepFx {
+            phrase_id,
+            step_index,
+            fx_slot,
+            fx,
+        })?;
+    }
+    Ok(())
+}
+
 fn step_fx_label(step: &Step) -> String {
     let mut slots = Vec::new();
 
@@ -1009,6 +1470,18 @@ fn option_u8_json(value: Option<u8>) -> String {
         .unwrap_or_else(|| String::from("null"))
 }
 
+fn option_usize_json(value: Option<usize>) -> String {
+    value
+        .map(|item| item.to_string())
+        .unwrap_or_else(|| String::from("null"))
+}
+
+fn option_u8_label(value: Option<u8>) -> String {
+    value
+        .map(|item| format!("{item:02}"))
+        .unwrap_or_else(|| String::from("--"))
+}
+
 fn editor_target_label(snapshot: UiSnapshot, chain_id: Option<u8>, phrase_id: Option<u8>) -> String {
     format!(
         "track={} song_row={} chain_row={} chain={} phrase={} step={}",
@@ -1027,6 +1500,10 @@ fn editor_target_label(snapshot: UiSnapshot, chain_id: Option<u8>, phrase_id: Op
 
 fn parse_u8_field(value: &str) -> Option<u8> {
     value.trim().parse::<u8>().ok()
+}
+
+fn parse_i16_field(value: &str) -> Option<i16> {
+    value.trim().parse::<i16>().ok()
 }
 
 fn seeded_note(step_index: usize) -> u8 {
@@ -1331,8 +1808,8 @@ footer { margin-top: 12px; color: var(--muted); font-size: 0.85rem; }
 <body>
 <main>
   <header>
-    <h1>P9 Tracker GUI Shell (Phase 18.1)</h1>
-    <span class="small">step editor parity + explicit edit target</span>
+    <h1>P9 Tracker GUI Shell (Phase 18.3)</h1>
+    <span class="small">power tools v1: duplicate/fill/clear/transpose/rotate + row clone helpers</span>
   </header>
 
   <section class="panel">
@@ -1369,7 +1846,7 @@ footer { margin-top: 12px; color: var(--muted); font-size: 0.85rem; }
         <button onclick="sendCmd('toggle_scale')">Toggle Scale Hint</button>
       </div>
       <div class="small" style="margin-top:10px">
-        Keys: Space/T toggle, G play, S stop, R rewind, arrows or H/J/K/L move, N/P switch screen, C/F/I/E edit flow, A/Z select, W/V copy-paste, Shift+V force paste, U/Y undo-redo, Ctrl+S save, Q quit.
+        Keys: Space/T toggle, G play, S stop, R rewind, arrows or H/J/K/L move, N/P switch screen, C/F/I/E edit flow, A/Z select, W/V copy-paste, Shift+V force paste, D duplicate, B fill, M clear block, [/] transpose, ,/. rotate, U/Y undo-redo, Ctrl+S save, Q quit.
       </div>
     </div>
 
@@ -1431,9 +1908,32 @@ footer { margin-top: 12px; color: var(--muted); font-size: 0.85rem; }
       <button onclick="sendCmd('edit_redo')">Redo (y)</button>
     </div>
     <div class="controls" style="margin-top:8px">
+      <button onclick="powerDuplicate()">Duplicate (d)</button>
+      <button onclick="powerDuplicate(true)">Duplicate Force</button>
+      <button onclick="powerFillSelection()">Fill (b)</button>
+      <button onclick="sendCmd('edit_power_clear_range')">Clear Block (m)</button>
+    </div>
+    <div class="controls" style="margin-top:8px">
+      <button onclick="powerTranspose(-1)">Transpose -1 ([)</button>
+      <button onclick="powerTranspose(1)">Transpose +1 (])</button>
+      <button onclick="powerRotate(-1)">Rotate Left (,)</button>
+      <button onclick="powerRotate(1)">Rotate Right (.)</button>
+    </div>
+    <div class="controls" style="margin-top:8px">
+      <button onclick="sendCmd('edit_song_clone_prev')">Song Clone Prev Row</button>
+      <button onclick="sendCmd('edit_chain_clone_prev')">Chain Clone Prev Row</button>
+    </div>
+    <div class="controls" style="margin-top:8px">
       <input id="edit-note" type="text" placeholder="note 0..127 (empty=seeded)" />
       <input id="edit-velocity" type="text" placeholder="velocity 1..127 (default 100)" />
       <input id="edit-instrument" type="text" placeholder="instrument id (default focused)" />
+    </div>
+    <div class="controls" style="margin-top:8px">
+      <input id="power-note" type="text" placeholder="fill note 0..127 (empty=seeded)" />
+      <input id="power-velocity" type="text" placeholder="fill velocity 1..127 (default 100)" />
+      <input id="power-instrument" type="text" placeholder="fill instrument (default focused)" />
+      <input id="power-transpose" type="text" placeholder="transpose delta (default +1)" />
+      <input id="power-rotate" type="text" placeholder="rotate shift (default +1)" />
     </div>
     <div class="small" style="margin-top:8px">Safety tags are returned as <code>info/warn/error</code> in Last Command.</div>
   </section>
@@ -1493,7 +1993,7 @@ footer { margin-top: 12px; color: var(--muted); font-size: 0.85rem; }
   </section>
 
   <footer>
-    Phase 18.2 goal: GUI-native selection, block copy/paste, and undo/redo visibility with safety semantics.
+    Phase 18.3 goal: power editing tools for repetitive authoring with deterministic safety semantics.
   </footer>
 </main>
 
@@ -1527,6 +2027,13 @@ const keyMap = {
   KeyV: 'edit_paste_safe',
   KeyU: 'edit_undo',
   KeyY: 'edit_redo',
+  KeyD: 'edit_power_duplicate',
+  KeyB: 'edit_power_fill',
+  KeyM: 'edit_power_clear_range',
+  BracketLeft: 'edit_power_transpose_down',
+  BracketRight: 'edit_power_transpose_up',
+  Comma: 'edit_power_rotate_left',
+  Period: 'edit_power_rotate_right',
   KeyQ: 'quit',
 };
 
@@ -1688,6 +2195,39 @@ function editWriteStep() {
   });
 }
 
+function readOptionalSignedInput(id) {
+  const value = document.getElementById(id).value.trim();
+  if (!value) {
+    return null;
+  }
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed)) {
+    return null;
+  }
+  return parsed;
+}
+
+function powerDuplicate(force = false) {
+  sendCmd('edit_power_duplicate', { force });
+}
+
+function powerFillSelection() {
+  const note = readOptionalNumberInput('power-note');
+  const velocity = readOptionalNumberInput('power-velocity');
+  const instrument = readOptionalNumberInput('power-instrument');
+  sendCmd('edit_power_fill', { note, velocity, instrument });
+}
+
+function powerTranspose(fallbackDelta = 1) {
+  const delta = readOptionalSignedInput('power-transpose');
+  sendCmd('edit_power_transpose', { delta: delta === null ? fallbackDelta : delta });
+}
+
+function powerRotate(fallbackShift = 1) {
+  const shift = readOptionalSignedInput('power-rotate');
+  sendCmd('edit_power_rotate', { shift: shift === null ? fallbackShift : shift });
+}
+
 async function refreshState() {
   try {
     const response = await fetch('/state');
@@ -1718,7 +2258,13 @@ async function refreshState() {
     document.getElementById('editor-bindings').textContent = `${fmtOptional(editor.bound_chain_id, true)} / ${fmtOptional(editor.bound_phrase_id, true)}`;
     document.getElementById('editor-instrument').textContent = `${editor.focused_instrument} (${editor.instrument_ready ? 'ready' : 'missing'})`;
     document.getElementById('editor-history').textContent = `undo ${editor.undo_depth} / redo ${editor.redo_depth}`;
-    document.getElementById('editor-buffer').textContent = `selection ${editor.selection_active ? 'set' : 'empty'} | clipboard ${editor.clipboard_ready ? 'ready' : 'empty'}${editor.overwrite_guard ? ' | overwrite-guard armed' : ''}`;
+    const selectionSpan = editor.selection_active
+      ? `${pad2(editor.selection_start)}-${pad2(editor.selection_end)}`
+      : 'empty';
+    const clipboardState = editor.clipboard_ready
+      ? `ready (${editor.clipboard_len})`
+      : 'empty';
+    document.getElementById('editor-buffer').textContent = `selection ${selectionSpan} | clipboard ${clipboardState}${editor.overwrite_guard ? ' | overwrite-guard armed' : ''}`;
 
     renderSong(state.views.song);
     renderChain(state.views.chain);
@@ -2095,6 +2641,260 @@ mod tests {
     }
 
     #[test]
+    fn edit_power_tools_fill_transpose_rotate_clear() {
+        let mut ui = UiController::default();
+        let mut engine = Engine::new("gui");
+        let mut runtime = RuntimeCoordinator::new(24);
+        let mut history = ProjectHistory::with_limit(GUI_HISTORY_LIMIT);
+        let mut edit_state = ShellEditState::default();
+
+        for command in ["edit_bind_chain", "edit_bind_phrase", "edit_ensure_instrument"] {
+            let status = apply_gui_command_with_query(
+                command,
+                None,
+                &mut ui,
+                &mut engine,
+                &mut runtime,
+                &mut history,
+                &mut edit_state,
+            );
+            assert!(status.starts_with("info:"));
+        }
+
+        ui.handle_action(UiAction::SelectStep(0), &mut engine, &mut runtime)
+            .unwrap();
+        let start = apply_gui_command_with_query(
+            "edit_select_start",
+            None,
+            &mut ui,
+            &mut engine,
+            &mut runtime,
+            &mut history,
+            &mut edit_state,
+        );
+        ui.handle_action(UiAction::SelectStep(3), &mut engine, &mut runtime)
+            .unwrap();
+        let end = apply_gui_command_with_query(
+            "edit_select_end",
+            None,
+            &mut ui,
+            &mut engine,
+            &mut runtime,
+            &mut history,
+            &mut edit_state,
+        );
+        assert!(start.starts_with("info:"));
+        assert!(end.starts_with("info:"));
+
+        let fill = apply_gui_command_with_query(
+            "edit_power_fill",
+            Some("velocity=99&instrument=0"),
+            &mut ui,
+            &mut engine,
+            &mut runtime,
+            &mut history,
+            &mut edit_state,
+        );
+        assert!(fill.starts_with("info:"));
+        let phrase = engine.snapshot().phrases.get(&0).unwrap();
+        assert_eq!(phrase.steps[0].note, Some(60));
+        assert_eq!(phrase.steps[1].note, Some(62));
+        assert_eq!(phrase.steps[2].note, Some(64));
+        assert_eq!(phrase.steps[3].note, Some(65));
+        assert_eq!(phrase.steps[0].velocity, 99);
+        assert_eq!(phrase.steps[0].instrument_id, Some(0));
+
+        let transpose = apply_gui_command_with_query(
+            "edit_power_transpose",
+            Some("delta=2"),
+            &mut ui,
+            &mut engine,
+            &mut runtime,
+            &mut history,
+            &mut edit_state,
+        );
+        assert!(transpose.starts_with("info:"));
+        let phrase = engine.snapshot().phrases.get(&0).unwrap();
+        assert_eq!(phrase.steps[0].note, Some(62));
+        assert_eq!(phrase.steps[1].note, Some(64));
+        assert_eq!(phrase.steps[2].note, Some(66));
+        assert_eq!(phrase.steps[3].note, Some(67));
+
+        let rotate = apply_gui_command_with_query(
+            "edit_power_rotate",
+            Some("shift=1"),
+            &mut ui,
+            &mut engine,
+            &mut runtime,
+            &mut history,
+            &mut edit_state,
+        );
+        assert!(rotate.starts_with("info:"));
+        let phrase = engine.snapshot().phrases.get(&0).unwrap();
+        assert_eq!(phrase.steps[0].note, Some(67));
+        assert_eq!(phrase.steps[1].note, Some(62));
+        assert_eq!(phrase.steps[2].note, Some(64));
+        assert_eq!(phrase.steps[3].note, Some(66));
+
+        let clear = apply_gui_command_with_query(
+            "edit_power_clear_range",
+            None,
+            &mut ui,
+            &mut engine,
+            &mut runtime,
+            &mut history,
+            &mut edit_state,
+        );
+        assert!(clear.starts_with("info:"));
+        let phrase = engine.snapshot().phrases.get(&0).unwrap();
+        for step in &phrase.steps[0..=3] {
+            assert_eq!(step.note, None);
+            assert_eq!(step.velocity, 0x40);
+            assert_eq!(step.instrument_id, None);
+        }
+    }
+
+    #[test]
+    fn edit_power_duplicate_and_row_clone_helpers_work() {
+        let mut ui = UiController::default();
+        let mut engine = Engine::new("gui");
+        let mut runtime = RuntimeCoordinator::new(24);
+        let mut history = ProjectHistory::with_limit(GUI_HISTORY_LIMIT);
+        let mut edit_state = ShellEditState::default();
+
+        for command in ["edit_bind_chain", "edit_bind_phrase", "edit_ensure_instrument"] {
+            let status = apply_gui_command_with_query(
+                command,
+                None,
+                &mut ui,
+                &mut engine,
+                &mut runtime,
+                &mut history,
+                &mut edit_state,
+            );
+            assert!(status.starts_with("info:"));
+        }
+
+        ui.handle_action(UiAction::SelectStep(0), &mut engine, &mut runtime)
+            .unwrap();
+        apply_gui_command_with_query(
+            "edit_select_start",
+            None,
+            &mut ui,
+            &mut engine,
+            &mut runtime,
+            &mut history,
+            &mut edit_state,
+        );
+        ui.handle_action(UiAction::SelectStep(1), &mut engine, &mut runtime)
+            .unwrap();
+        apply_gui_command_with_query(
+            "edit_select_end",
+            None,
+            &mut ui,
+            &mut engine,
+            &mut runtime,
+            &mut history,
+            &mut edit_state,
+        );
+        let _ = apply_gui_command_with_query(
+            "edit_power_fill",
+            Some("note=72&velocity=88&instrument=0"),
+            &mut ui,
+            &mut engine,
+            &mut runtime,
+            &mut history,
+            &mut edit_state,
+        );
+
+        ui.handle_action(UiAction::SelectStep(0), &mut engine, &mut runtime)
+            .unwrap();
+        let duplicate = apply_gui_command_with_query(
+            "edit_power_duplicate",
+            None,
+            &mut ui,
+            &mut engine,
+            &mut runtime,
+            &mut history,
+            &mut edit_state,
+        );
+        assert!(duplicate.starts_with("info:"));
+        let phrase = engine.snapshot().phrases.get(&0).unwrap();
+        assert_eq!(phrase.steps[2].note, Some(72));
+        assert_eq!(phrase.steps[3].note, Some(72));
+        assert_eq!(phrase.steps[2].velocity, 88);
+        assert_eq!(phrase.steps[3].velocity, 88);
+
+        ui.handle_action(UiAction::EnsureChain { chain_id: 9 }, &mut engine, &mut runtime)
+            .unwrap();
+        ui.handle_action(
+            UiAction::BindTrackRowToChain {
+                song_row: 0,
+                chain_id: Some(9),
+            },
+            &mut engine,
+            &mut runtime,
+        )
+        .unwrap();
+        ui.handle_action(UiAction::SelectSongRow(1), &mut engine, &mut runtime)
+            .unwrap();
+
+        let song_clone = apply_gui_command_with_query(
+            "edit_song_clone_prev",
+            None,
+            &mut ui,
+            &mut engine,
+            &mut runtime,
+            &mut history,
+            &mut edit_state,
+        );
+        assert!(song_clone.starts_with("info:"));
+        assert_eq!(
+            engine
+                .snapshot()
+                .song
+                .tracks
+                .get(0)
+                .unwrap()
+                .song_rows
+                .get(1)
+                .copied()
+                .flatten(),
+            Some(9)
+        );
+
+        ui.handle_action(UiAction::EnsurePhrase { phrase_id: 42 }, &mut engine, &mut runtime)
+            .unwrap();
+        ui.handle_action(
+            UiAction::BindChainRowToPhrase {
+                chain_id: 9,
+                chain_row: 0,
+                phrase_id: Some(42),
+                transpose: 3,
+            },
+            &mut engine,
+            &mut runtime,
+        )
+        .unwrap();
+        ui.handle_action(UiAction::SelectChainRow(1), &mut engine, &mut runtime)
+            .unwrap();
+
+        let chain_clone = apply_gui_command_with_query(
+            "edit_chain_clone_prev",
+            None,
+            &mut ui,
+            &mut engine,
+            &mut runtime,
+            &mut history,
+            &mut edit_state,
+        );
+        assert!(chain_clone.starts_with("info:"));
+        let chain = engine.snapshot().chains.get(&9).unwrap();
+        assert_eq!(chain.rows[1].phrase_id, Some(42));
+        assert_eq!(chain.rows[1].transpose, 3);
+    }
+
+    #[test]
     fn edit_write_step_warns_when_bind_context_missing() {
         let mut ui = UiController::default();
         let mut engine = Engine::new("gui");
@@ -2231,7 +3031,10 @@ mod tests {
         assert!(json.contains("\"undo_depth\":"));
         assert!(json.contains("\"redo_depth\":"));
         assert!(json.contains("\"selection_active\":"));
+        assert!(json.contains("\"selection_start\":"));
+        assert!(json.contains("\"selection_end\":"));
         assert!(json.contains("\"clipboard_ready\":"));
+        assert!(json.contains("\"clipboard_len\":"));
         assert!(json.contains("\"overwrite_guard\":"));
         assert!(json.contains("\"recovery\":\"clean-start\""));
         assert!(json.contains("\"views\":{"));

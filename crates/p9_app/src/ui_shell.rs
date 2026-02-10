@@ -87,6 +87,14 @@ pub struct StepSelection {
     end_step: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SelectionRange {
+    pub track_index: usize,
+    pub phrase_id: u8,
+    pub start_step: usize,
+    pub end_step: usize,
+}
+
 impl StepSelection {
     fn matches_scope(&self, track_index: usize, phrase_id: u8) -> bool {
         self.track_index == track_index && self.phrase_id == phrase_id
@@ -147,6 +155,24 @@ impl ShellEditState {
 
     pub fn has_overwrite_guard(&self) -> bool {
         self.paste_overwrite_guard.is_some()
+    }
+
+    pub fn selection_range(&self) -> Option<SelectionRange> {
+        let selection = self.selection.as_ref()?;
+        let (start_step, end_step) = selection.normalized_range();
+        Some(SelectionRange {
+            track_index: selection.track_index,
+            phrase_id: selection.phrase_id,
+            start_step,
+            end_step,
+        })
+    }
+
+    pub fn clipboard_len(&self) -> usize {
+        self.clipboard
+            .as_ref()
+            .map(|clipboard| clipboard.steps.len())
+            .unwrap_or(0)
     }
 }
 

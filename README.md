@@ -2,7 +2,7 @@
 
 ## Status
 
-- Current stage: `Phase 18.2 selection/block ops and undo/redo UX completed`
+- Current stage: `Phase 18.3 power tools v1 completed`
 - Main implementation stack: `Rust`
 
 ## Phase 1 Artifacts
@@ -113,6 +113,10 @@
 ## Phase 18.2 Artifacts
 
 - `docs/phase18_2_selection_block_undo_redo.md`
+
+## Phase 18.3 Artifacts
+
+- `docs/phase18_3_power_tools_v1.md`
 
 ## Forward Plan
 
