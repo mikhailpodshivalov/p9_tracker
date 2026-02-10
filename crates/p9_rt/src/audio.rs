@@ -28,6 +28,9 @@ pub struct AudioMetrics {
     pub voice_polyphony_pressure_total: u64,
     pub voice_sampler_mode_note_on_total: u64,
     pub voice_silent_note_on_total: u64,
+    pub voice_mixer_muted_note_on_total: u64,
+    pub voice_send_routed_note_on_total: u64,
+    pub voice_send_level_total: u64,
 }
 
 impl Default for AudioMetrics {
@@ -57,6 +60,9 @@ impl Default for AudioMetrics {
             voice_polyphony_pressure_total: 0,
             voice_sampler_mode_note_on_total: 0,
             voice_silent_note_on_total: 0,
+            voice_mixer_muted_note_on_total: 0,
+            voice_send_routed_note_on_total: 0,
+            voice_send_level_total: 0,
         }
     }
 }
@@ -150,6 +156,9 @@ pub struct NativeAudioBackend {
     voices: VoiceAllocator,
     sampler_mode_note_on_total: u64,
     silent_note_on_total: u64,
+    mixer_muted_note_on_total: u64,
+    send_routed_note_on_total: u64,
+    send_level_total: u64,
 }
 
 impl NativeAudioBackend {
@@ -168,6 +177,9 @@ impl NativeAudioBackend {
             voices: VoiceAllocator::new(config.max_voices),
             sampler_mode_note_on_total: 0,
             silent_note_on_total: 0,
+            mixer_muted_note_on_total: 0,
+            send_routed_note_on_total: 0,
+            send_level_total: 0,
             config,
         }
     }
@@ -212,6 +224,11 @@ impl AudioBackend for NativeAudioBackend {
                     note,
                     velocity,
                     render_mode,
+                    track_level,
+                    master_level,
+                    send_mfx,
+                    send_delay,
+                    send_reverb,
                     instrument_id,
                     waveform,
                     attack_ms,
@@ -219,10 +236,26 @@ impl AudioBackend for NativeAudioBackend {
                     gain,
                     ..
                 } => {
-                    if *gain == 0 || matches!(render_mode, RenderMode::ExternalMuted) {
+                    let effective_gain = routed_gain(*gain, *track_level, *master_level);
+                    if effective_gain == 0 || matches!(render_mode, RenderMode::ExternalMuted) {
+                        if *gain > 0
+                            && !matches!(render_mode, RenderMode::ExternalMuted)
+                            && (*track_level == 0 || *master_level == 0)
+                        {
+                            self.mixer_muted_note_on_total =
+                                self.mixer_muted_note_on_total.saturating_add(1);
+                        }
                         self.silent_note_on_total = self.silent_note_on_total.saturating_add(1);
                         continue;
                     }
+
+                    let send_total = *send_mfx as u64 + *send_delay as u64 + *send_reverb as u64;
+                    if send_total > 0 {
+                        self.send_routed_note_on_total =
+                            self.send_routed_note_on_total.saturating_add(1);
+                        self.send_level_total = self.send_level_total.saturating_add(send_total);
+                    }
+
                     if matches!(render_mode, RenderMode::SamplerV1) {
                         self.sampler_mode_note_on_total =
                             self.sampler_mode_note_on_total.saturating_add(1);
@@ -235,7 +268,7 @@ impl AudioBackend for NativeAudioBackend {
                         *waveform,
                         *attack_ms,
                         *release_ms,
-                        *gain,
+                        effective_gain,
                     );
                 }
                 RenderEvent::NoteOff { track_id, note } => {
@@ -281,6 +314,9 @@ impl AudioBackend for NativeAudioBackend {
         self.metrics.voice_polyphony_pressure_total = lifecycle.polyphony_pressure_total;
         self.metrics.voice_sampler_mode_note_on_total = self.sampler_mode_note_on_total;
         self.metrics.voice_silent_note_on_total = self.silent_note_on_total;
+        self.metrics.voice_mixer_muted_note_on_total = self.mixer_muted_note_on_total;
+        self.metrics.voice_send_routed_note_on_total = self.send_routed_note_on_total;
+        self.metrics.voice_send_level_total = self.send_level_total;
     }
 
     fn events_consumed(&self) -> usize {
@@ -294,6 +330,11 @@ impl AudioBackend for NativeAudioBackend {
     fn backend_name(&self) -> &'static str {
         "native-simulated-linux"
     }
+}
+
+fn routed_gain(gain: u8, track_level: u8, master_level: u8) -> u8 {
+    let scaled = gain as u32 * track_level as u32 * master_level as u32;
+    (scaled / (127 * 127)).min(127) as u8
 }
 
 pub fn build_preferred_audio_backend(prefer_native: bool) -> Box<dyn AudioBackend> {
@@ -644,5 +685,68 @@ mod tests {
         let metrics = backend.metrics();
         assert_eq!(metrics.voice_sampler_mode_note_on_total, 1);
         assert_eq!(metrics.voice_note_on_total, 1);
+    }
+
+    #[test]
+    fn mixer_zero_level_mutes_note_on_and_counts_routing_mute() {
+        let mut backend = NativeAudioBackend::new(AudioBackendConfig::default());
+        backend.start_checked().unwrap();
+
+        backend.push_events(&[RenderEvent::NoteOn {
+            track_id: 0,
+            note: 64,
+            velocity: 100,
+            render_mode: RenderMode::Synth,
+            track_level: 0,
+            master_level: 127,
+            send_mfx: 0,
+            send_delay: 0,
+            send_reverb: 0,
+            instrument_id: Some(0),
+            waveform: SynthWaveform::Saw,
+            attack_ms: 1,
+            release_ms: 24,
+            gain: 100,
+            sampler_variant: p9_core::model::SamplerRenderVariant::Classic,
+            sampler_transient_level: 64,
+            sampler_body_level: 96,
+        }]);
+
+        let metrics = backend.metrics();
+        assert_eq!(metrics.voice_note_on_total, 0);
+        assert_eq!(metrics.voice_silent_note_on_total, 1);
+        assert_eq!(metrics.voice_mixer_muted_note_on_total, 1);
+        assert_eq!(metrics.active_voices, 0);
+    }
+
+    #[test]
+    fn send_routing_activity_is_tracked() {
+        let mut backend = NativeAudioBackend::new(AudioBackendConfig::default());
+        backend.start_checked().unwrap();
+
+        backend.push_events(&[RenderEvent::NoteOn {
+            track_id: 0,
+            note: 67,
+            velocity: 100,
+            render_mode: RenderMode::Synth,
+            track_level: 127,
+            master_level: 127,
+            send_mfx: 10,
+            send_delay: 20,
+            send_reverb: 30,
+            instrument_id: Some(0),
+            waveform: SynthWaveform::Saw,
+            attack_ms: 1,
+            release_ms: 24,
+            gain: 100,
+            sampler_variant: p9_core::model::SamplerRenderVariant::Classic,
+            sampler_transient_level: 64,
+            sampler_body_level: 96,
+        }]);
+
+        let metrics = backend.metrics();
+        assert_eq!(metrics.voice_note_on_total, 1);
+        assert_eq!(metrics.voice_send_routed_note_on_total, 1);
+        assert_eq!(metrics.voice_send_level_total, 60);
     }
 }

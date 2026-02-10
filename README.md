@@ -2,7 +2,7 @@
 
 ## Status
 
-- Current stage: `Phase 19.3b export routing parity completed`
+- Current stage: `Phase 19.3c realtime routing telemetry completed`
 - Main implementation stack: `Rust`
 
 ## Phase 1 Artifacts
@@ -157,6 +157,10 @@
 ## Phase 19.3b Artifacts
 
 - `docs/phase19_3b_export_routing_parity.md`
+
+## Phase 19.3c Artifacts
+
+- `docs/phase19_3c_realtime_routing_telemetry.md`
 
 ## Forward Plan
 
