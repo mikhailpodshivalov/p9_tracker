@@ -2,7 +2,7 @@
 
 ## Status
 
-- Current stage: `Phase 16.2 selection and block operations completed`
+- Current stage: `Phase 16.3 dirty state and recovery entry completed`
 - Main implementation stack: `Rust`
 
 ## Phase 1 Artifacts
@@ -87,6 +87,7 @@
 - `docs/phase16_plan.md`
 - `docs/phase16_1_undo_redo_foundation.md`
 - `docs/phase16_2_selection_block_ops.md`
+- `docs/phase16_3_dirty_recovery_entry.md`
 
 ## Forward Plan
 

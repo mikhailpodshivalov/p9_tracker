@@ -1,5 +1,11 @@
 use std::io::{self, Write};
+use std::path::Path;
 
+use crate::hardening::{
+    clear_dirty_session_flag, default_autosave_path, default_dirty_flag_path,
+    mark_dirty_session_flag, recover_from_dirty_session, AutosaveManager, AutosavePolicy,
+    DirtyStateTracker,
+};
 use crate::runtime::RuntimeCoordinator;
 use crate::ui::{ScaleHighlightState, UiAction, UiController, UiError, UiScreen, UiSnapshot};
 use p9_core::engine::{Engine, EngineCommand};
@@ -11,6 +17,7 @@ const SONG_VIEW_ROWS: usize = 8;
 const CHAIN_VIEW_ROWS: usize = 8;
 const PHRASE_COLS: usize = 4;
 const HISTORY_LIMIT: usize = 128;
+const SHELL_AUTOSAVE_INTERVAL_TICKS: u64 = 16;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ShellCommandResult {
@@ -108,8 +115,18 @@ pub fn run_interactive_shell(
     engine: &mut Engine,
     runtime: &mut RuntimeCoordinator,
 ) -> io::Result<()> {
-    let mut status =
-        String::from("Shell ready. Commands: n/p/h/l/j/k/t/r/c/f/i/e/a/z/w/v/x/+/-/u/y/?/q");
+    let autosave_path = default_autosave_path();
+    let dirty_flag_path = default_dirty_flag_path();
+    let recovery_status = recover_from_dirty_session(engine, &autosave_path, &dirty_flag_path);
+    let mut dirty_tracker = DirtyStateTracker::from_engine(engine);
+    let mut autosave = AutosaveManager::new(AutosavePolicy {
+        interval_ticks: SHELL_AUTOSAVE_INTERVAL_TICKS,
+    });
+
+    let mut status = format!(
+        "Shell ready. Commands: n/p/h/l/j/k/t/r/c/f/i/e/a/z/w/v/x/+/-/u/y/?/q | recovery={}",
+        recovery_status.label()
+    );
     let mut audio = NoopAudioBackend::default();
     audio.start();
     let mut midi_output = NoopMidiOutput::default();
@@ -138,15 +155,31 @@ pub fn run_interactive_shell(
             &mut edit_state,
         ) {
             Ok(ShellCommandResult::Continue(next_status)) => {
-                status = match runtime.run_tick_safe(engine, &mut audio, &mut midi_output) {
-                    Ok(report) => format!(
-                        "{} | transport={} tick={}",
-                        next_status,
-                        transport_label(report.is_playing),
-                        report.tick
-                    ),
-                    Err(_) => format!("{} | runtime fault", next_status),
+                let tick_status = match runtime.run_tick_safe(engine, &mut audio, &mut midi_output) {
+                    Ok(report) => {
+                        format!(
+                            "transport={} tick={}",
+                            transport_label(report.is_playing),
+                            report.tick
+                        )
+                    }
+                    Err(_) => String::from("runtime fault"),
                 };
+                let hardening_status = update_session_hardening(
+                    engine,
+                    runtime,
+                    &mut dirty_tracker,
+                    &mut autosave,
+                    &autosave_path,
+                    &dirty_flag_path,
+                );
+                status = format!(
+                    "{} | {} | recovery={} | {}",
+                    next_status,
+                    tick_status,
+                    recovery_status.label(),
+                    hardening_status
+                );
             }
             Ok(ShellCommandResult::Exit) => {
                 break;
@@ -557,7 +590,7 @@ pub fn apply_shell_command_with_state(
 pub fn render_frame(project: &ProjectData, snapshot: UiSnapshot, status: &str) -> String {
     let mut out = String::new();
 
-    out.push_str("P9 Tracker UI Shell (Phase 16.2)\n");
+    out.push_str("P9 Tracker UI Shell (Phase 16.3)\n");
     out.push_str("Screen Tabs: ");
     out.push_str(&tab(UiScreen::Song, snapshot.screen));
     out.push(' ');
@@ -690,6 +723,48 @@ fn is_mutating_command(command: &str) -> bool {
 
 fn command_did_mutate(result: &ShellCommandResult) -> bool {
     matches!(result, ShellCommandResult::Continue(msg) if !msg.starts_with("warn:"))
+}
+
+fn update_session_hardening(
+    engine: &Engine,
+    runtime: &RuntimeCoordinator,
+    dirty_tracker: &mut DirtyStateTracker,
+    autosave: &mut AutosaveManager,
+    autosave_path: &Path,
+    dirty_flag_path: &Path,
+) -> String {
+    let mut dirty = dirty_tracker.is_dirty(engine);
+    let mut autosave_status = String::from("idle");
+
+    if dirty && mark_dirty_session_flag(dirty_flag_path).is_err() {
+        autosave_status = String::from("flag-error");
+    }
+
+    match autosave.save_if_due(engine, runtime.snapshot(), dirty, autosave_path) {
+        Ok(true) => {
+            dirty_tracker.mark_saved(engine);
+            dirty = false;
+            if clear_dirty_session_flag(dirty_flag_path).is_err() {
+                autosave_status = format!("saved@{}+flag-error", autosave.last_saved_tick());
+            } else {
+                autosave_status = format!("saved@{}", autosave.last_saved_tick());
+            }
+        }
+        Ok(false) => {
+            if !dirty {
+                let _ = clear_dirty_session_flag(dirty_flag_path);
+            }
+        }
+        Err(_) => {
+            autosave_status = String::from("error");
+        }
+    }
+
+    format!(
+        "dirty={} autosave={}",
+        if dirty { "yes" } else { "no" },
+        autosave_status
+    )
 }
 
 fn wrap_next(current: usize, len: usize) -> usize {
@@ -880,7 +955,7 @@ mod tests {
         let snapshot = ui.snapshot(&engine, &runtime);
         let frame = render_frame(engine.snapshot(), snapshot, "ok");
 
-        assert!(frame.contains("P9 Tracker UI Shell (Phase 16.2)"));
+        assert!(frame.contains("P9 Tracker UI Shell (Phase 16.3)"));
         assert!(frame.contains("Screen Tabs:"));
         assert!(frame.contains("Song Panel"));
         assert!(frame.contains("Commands: n/p screen"));
